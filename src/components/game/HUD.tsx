@@ -23,11 +23,14 @@ const HUD = ({ energy, size, bestSize, elementsEaten, buffs, freedom, mode, onMo
     <>
       {/* top-left status */}
       <div className="absolute top-3 left-3 hud-panel px-4 py-3 w-[230px] animate-fade-in">
-        <div className="flex items-center gap-2 mb-2">
+        <div className="flex items-center gap-2 mb-0.5">
           <Icon name="Dna" size={16} className="text-[#5ff0e0]" />
           <span className="font-mono text-[11px] tracking-[0.2em] text-[#5ff0e0] uppercase">
             {freedom ? 'Лаборатория' : 'Пробирка А-7'}
           </span>
+        </div>
+        <div className="font-mono text-[9px] italic text-white/35 mb-2 pl-[22px] -mt-0.5">
+          P. polycephalum
         </div>
 
         <Bar

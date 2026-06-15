@@ -211,13 +211,16 @@ const StartScreen = ({ onStart, save }: { onStart: () => void; save: Save }) => 
     <div className="relative text-center px-6 animate-fade-in">
       <div className="inline-flex items-center gap-2 mb-4 hud-panel px-4 py-1.5">
         <Icon name="FlaskConical" size={14} className="text-[#5ff0e0]" />
-        <span className="font-mono text-[10px] tracking-[0.3em] uppercase text-[#5ff0e0]">Bio-Sim Protocol</span>
+        <span className="font-mono text-[10px] tracking-[0.3em] uppercase text-[#5ff0e0]">Physarum polycephalum</span>
       </div>
-      <h1 className="font-display font-black text-6xl md:text-8xl text-white mb-3 leading-none">
+      <h1 className="font-display font-black text-6xl md:text-8xl text-white mb-2 leading-none">
         SLIME<span className="text-[#5ff0e0] text-glow">LAB</span>
       </h1>
+      <p className="font-mono text-[11px] italic tracking-wider text-white/40 mb-5">
+        многоголовый слизевик · организм без мозга, строящий оптимальные сети
+      </p>
       <p className="text-white/60 max-w-md mx-auto mb-8 leading-relaxed">
-        Ты — разумный слизевик в стеклянной пробирке. Осязай мир мерцающими волнами, поглощай элементы, расти и сбеги в гигантскую лабораторию.
+        Ты — <span className="text-white/90">Physarum polycephalum</span>, плазмодий-миксомицет в стеклянной пробирке. Раскидывай протоплазматическую сеть, осязай мир хемотаксисом-волнами, поглощай элементы и сбеги в гигантскую лабораторию.
       </p>
 
       <button
