@@ -1,17 +1,3 @@
-export interface Vec {
-  x: number;
-  y: number;
-}
-
-export interface Node {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  age: number;
-  parent: number;
-}
-
 export interface Wave {
   x: number;
   y: number;
