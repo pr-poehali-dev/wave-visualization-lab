@@ -97,5 +97,49 @@
 
   body {
     @apply bg-background text-foreground;
+    font-family: "Rubik", sans-serif;
+    overflow: hidden;
+    overscroll-behavior: none;
   }
+}
+
+:root {
+  --lab-bg: #04070d;
+  --lab-cyan: #5ff0e0;
+  --lab-blue: #3aa9ff;
+  --lab-amber: #ffb347;
+  --lab-glass: rgba(120, 200, 255, 0.08);
+}
+
+.hud-panel {
+  background: rgba(8, 16, 28, 0.62);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(95, 240, 224, 0.18);
+  border-radius: 14px;
+  box-shadow:
+    0 8px 40px rgba(0, 0, 0, 0.5),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.scan-line {
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(95, 240, 224, 0.6),
+    transparent
+  );
+}
+
+.text-glow {
+  text-shadow: 0 0 12px currentColor;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(95, 240, 224, 0.3);
+  border-radius: 3px;
 }
