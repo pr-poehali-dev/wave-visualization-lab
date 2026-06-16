@@ -64,13 +64,6 @@ const HUD = ({ energy, size, bestSize, elementsEaten, buffs, freedom, mode, onMo
       {/* top-right controls */}
       <div className="absolute top-3 right-3 flex flex-col gap-2 items-end animate-fade-in">
         <button
-          onClick={onMode}
-          className="hud-panel px-3 py-2 flex items-center gap-2 text-white/80 hover:text-white transition-colors text-xs font-mono"
-        >
-          <Icon name={mode === 'follow' ? 'MousePointer2' : 'Crosshair'} size={14} className="text-[#5ff0e0]" />
-          {mode === 'follow' ? 'Следование' : 'Цель'}
-        </button>
-        <button
           onClick={onAchievements}
           className="hud-panel px-3 py-2 flex items-center gap-2 text-white/80 hover:text-white transition-colors text-xs font-mono"
         >
