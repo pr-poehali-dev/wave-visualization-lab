@@ -11,7 +11,7 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { ELEMENTS, BUFF_META, EXPERIMENTS } from './data';
+import { BUFF_META, EXPERIMENTS } from './data';
 import { Buff, ExperimentEvent, GamePhase } from './types';
 
 // ─── типы ─────────────────────────────────────────────────────────────────────
@@ -126,19 +126,35 @@ const C_VEIN   = new THREE.Color(0.78, 0.88, 0.18);
 const C_CORE   = new THREE.Color(0.95, 1.00, 0.50);
 const C_TIP    = new THREE.Color(0.90, 1.00, 0.25);
 const C_MEGA   = new THREE.Color(1.00, 0.82, 0.10);
+const C_WAVE   = new THREE.Color(0.78, 0.97, 1.0);
 
 let _id = 0;
 const uid = () => ++_id;
 
 // ─── утилиты Three.js ─────────────────────────────────────────────────────────
 
+// Кэшированные нормали поверхностей — не создаём new Vector3 в каждом кадре
+const SURFACE_NORMALS: Record<Surface, THREE.Vector3> = {
+  floor:   new THREE.Vector3(0, 1, 0),
+  ceiling: new THREE.Vector3(0, -1, 0),
+  wall_px: new THREE.Vector3(-1, 0, 0),
+  wall_nx: new THREE.Vector3(1, 0, 0),
+  wall_pz: new THREE.Vector3(0, 0, -1),
+  wall_nz: new THREE.Vector3(0, 0, 1),
+};
+
+// Переиспользуемые temp-векторы чтобы не создавать new Vector3 в loop
+const _tmpA = new THREE.Vector3();
+const _tmpC = new THREE.Vector3();
+const _yUp  = new THREE.Vector3(0, 1, 0);
+
 function makeCylinder(pa: THREE.Vector3, pb: THREE.Vector3, r: number, mat: THREE.Material): THREE.Mesh {
-  const dir = new THREE.Vector3().subVectors(pb, pa);
-  const len = dir.length() || 0.01;
+  _tmpA.subVectors(pb, pa);
+  const len = _tmpA.length() || 0.01;
   const geo = new THREE.CylinderGeometry(r, r, len, 7, 1);
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.copy(pa).addScaledVector(dir.normalize(), len / 2);
-  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+  mesh.position.copy(pa).addScaledVector(_tmpA.normalize(), len / 2);
+  mesh.quaternion.setFromUnitVectors(_yUp, _tmpA);
   return mesh;
 }
 
@@ -146,48 +162,20 @@ function makeSphere(r: number, mat: THREE.Material): THREE.Mesh {
   return new THREE.Mesh(new THREE.SphereGeometry(r, 8, 8), mat);
 }
 
-// получить нормаль поверхности
+// получить нормаль поверхности — возвращает кэшированный объект (readonly)
 function surfaceNormal(s: Surface): THREE.Vector3 {
-  switch (s) {
-    case 'floor':   return new THREE.Vector3(0, 1, 0);
-    case 'ceiling': return new THREE.Vector3(0, -1, 0);
-    case 'wall_px': return new THREE.Vector3(-1, 0, 0);
-    case 'wall_nx': return new THREE.Vector3(1, 0, 0);
-    case 'wall_pz': return new THREE.Vector3(0, 0, -1);
-    case 'wall_nz': return new THREE.Vector3(0, 0, 1);
-  }
+  return SURFACE_NORMALS[s];
 }
 
-// спроецировать вектор движения на плоскость поверхности
-function projectOnSurface(dir: THREE.Vector3, s: Surface): THREE.Vector3 {
-  const n = surfaceNormal(s);
-  return dir.clone().addScaledVector(n, -dir.dot(n)).normalize();
+// спроецировать вектор движения на плоскость поверхности — пишет в out
+function projectOnSurface(dir: THREE.Vector3, s: Surface, out?: THREE.Vector3): THREE.Vector3 {
+  const n = SURFACE_NORMALS[s];
+  const res = out ?? _tmpC;
+  res.copy(dir).addScaledVector(n, -dir.dot(n));
+  if (res.lengthSq() > 0) res.normalize();
+  return res;
 }
 
-// начальная позиция на поверхности
-function surfacePosition(s: Surface, u: number, v: number): THREE.Vector3 {
-  switch (s) {
-    case 'floor':   return new THREE.Vector3(u, 0.02, v);
-    case 'ceiling': return new THREE.Vector3(u, LAB_H - 0.02, v);
-    case 'wall_px': return new THREE.Vector3(LAB_W / 2 - 0.02, u, v);
-    case 'wall_nx': return new THREE.Vector3(-LAB_W / 2 + 0.02, u, v);
-    case 'wall_pz': return new THREE.Vector3(u, v, LAB_D / 2 - 0.02);
-    case 'wall_nz': return new THREE.Vector3(u, v, -LAB_D / 2 + 0.02);
-  }
-}
-
-// остаётся ли позиция на поверхности (в пределах стен/пола)
-function onSurface(pos: THREE.Vector3, s: Surface): boolean {
-  const h = LAB_H, w = LAB_W / 2, d = LAB_D / 2;
-  switch (s) {
-    case 'floor':
-    case 'ceiling': return Math.abs(pos.x) < w && Math.abs(pos.z) < d;
-    case 'wall_px':
-    case 'wall_nx': return pos.y > 0 && pos.y < h && Math.abs(pos.z) < d;
-    case 'wall_pz':
-    case 'wall_nz': return pos.y > 0 && pos.y < h && Math.abs(pos.x) < w;
-  }
-}
 
 // ─── главный движок ───────────────────────────────────────────────────────────
 
@@ -232,6 +220,18 @@ export class GameEngine3D {
 
   // статистика убийств
   kills = { bacteria: 0, fungus: 0, nematode: 0 };
+
+  // капли протоплазмы — обновляются в главном loop, не в RAF
+  drops: { t: number; veinA: number; veinB: number; dir: number; mesh: THREE.Mesh }[] = [];
+
+  // temp-векторы для update методов (не создаём new в кадре)
+  _tv1 = new THREE.Vector3();
+  _tv2 = new THREE.Vector3();
+  _tv3 = new THREE.Vector3();
+  _blobTarget = new THREE.Vector3();
+
+  // индекс вейнов по junction-id для O(1) pruneJ
+  veinsByJ = new Map<number, Set<number>>();
 
   raf = 0;
   running = false;
@@ -676,6 +676,11 @@ export class GameEngine3D {
     const mesh = makeCylinder(ja.pos, jb.pos, r, mat);
     this.scene.add(mesh);
     this.veins.set(id, { id, a, b, radius: r, flow: 0, phase: Math.random() * Math.PI * 2, age: 0, mesh });
+    // индекс
+    if (!this.veinsByJ.has(a)) this.veinsByJ.set(a, new Set());
+    if (!this.veinsByJ.has(b)) this.veinsByJ.set(b, new Set());
+    this.veinsByJ.get(a)!.add(id);
+    this.veinsByJ.get(b)!.add(id);
     return id;
   }
 
@@ -696,6 +701,8 @@ export class GameEngine3D {
   removeVein(id: number) {
     const v = this.veins.get(id); if (!v) return;
     this.scene.remove(v.mesh); this.disposeObject(v.mesh);
+    this.veinsByJ.get(v.a)?.delete(id);
+    this.veinsByJ.get(v.b)?.delete(id);
     this.veins.delete(id);
   }
 
@@ -750,6 +757,7 @@ export class GameEngine3D {
     this.updateVeins(dt, t);
     this.updateTips(dt, t);
     this.pruneDeadVeins();
+    this.updateDrops(dt);
     this.updateOrganisms(dt, t);
     this.updateWaves(dt);
 
@@ -820,7 +828,8 @@ export class GameEngine3D {
 
   updateBlob(dt: number, t: number) {
     const c = this.getCentroid();
-    this.blobPos.lerp(new THREE.Vector3(c.x, 0.05, c.z), dt * 3);
+    this._blobTarget.set(c.x, 0.05, c.z);
+    this.blobPos.lerp(this._blobTarget, dt * 3);
     this.blobMesh.position.copy(this.blobPos);
 
     // пульсация
@@ -886,32 +895,20 @@ export class GameEngine3D {
       mat.emissiveIntensity = (0.3 + Math.min(1, af * 700) * 0.7) * pulse;
       mat.opacity = 0.7 + pulse * 0.18;
 
-      // обновляем цилиндр если радиус изменился
+      // обновляем масштаб цилиндра вместо пересоздания геометрии
       const curR = (v.mesh.geometry as THREE.CylinderGeometry).parameters?.radiusTop ?? 0;
       if (Math.abs(curR - v.radius) > 0.012) {
-        const dir = new THREE.Vector3().subVectors(jb.pos, ja.pos);
-        const len = dir.length() || 0.01;
-        v.mesh.geometry.dispose();
-        v.mesh.geometry = new THREE.CylinderGeometry(v.radius, v.radius, len, 7, 1);
-        v.mesh.position.copy(ja.pos).addScaledVector(dir.normalize(), len / 2);
-        v.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+        const scale = v.radius / Math.max(curR, 0.001);
+        v.mesh.scale.x = scale;
+        v.mesh.scale.z = scale;
       }
 
-      // бегущие капли протоплазмы
-      if (v.radius > 0.3 && Math.abs(v.flow) > 0.00002 && Math.random() < 0.015) {
-        const drop = makeSphere(v.radius * 0.55, new THREE.MeshBasicMaterial({ color: C_CORE }));
-        const dropProg = { t: 0, vein: v, mesh: drop, dir: v.flow > 0 ? 1 : -1 };
+      // бегущие капли протоплазмы — добавляем в массив, анимируем в update()
+      if (this.drops.length < 40 && v.radius > 0.3 && Math.abs(v.flow) > 0.00002 && Math.random() < 0.008) {
+        const drop = makeSphere(v.radius * 0.5, new THREE.MeshBasicMaterial({ color: C_CORE }));
         drop.position.copy(ja.pos);
         this.scene.add(drop);
-        // анимируем каплю за 0.5с
-        const animate = () => {
-          dropProg.t += 0.03;
-          if (dropProg.t >= 1) { this.scene.remove(drop); this.disposeObject(drop); return; }
-          const frac = dropProg.dir > 0 ? dropProg.t : 1 - dropProg.t;
-          drop.position.lerpVectors(ja.pos, jb.pos, frac);
-          requestAnimationFrame(animate);
-        };
-        requestAnimationFrame(animate);
+        this.drops.push({ t: 0, veinA: v.a, veinB: v.b, dir: v.flow > 0 ? 1 : -1, mesh: drop });
       }
     }
   }
@@ -926,19 +923,20 @@ export class GameEngine3D {
       const junc = this.junctions.get(tip.junctionId);
       if (!junc) { this.removeTip(i); continue; }
 
-      // хемотаксис к цели (проекция на поверхность)
-      const toTarget = new THREE.Vector3().subVectors(this.targetPos, junc.pos);
-      const attract = projectOnSurface(toTarget, tip.surface).normalize();
+      // хемотаксис к цели — переиспользуем _tv1 вместо new Vector3
+      this._tv1.subVectors(this.targetPos, junc.pos);
+      projectOnSurface(this._tv1, tip.surface, this._tv2);  // attract в _tv2
+      const attract = this._tv2;
 
-      // притяжение к ближайшей еде/бактерии
-      let bestFoodDir = new THREE.Vector3();
+      // притяжение к ближайшей бактерии — _tv3 как bestFoodDir
+      this._tv3.set(0, 0, 0);
       let bestFoodD = Infinity;
       for (const org of this.organisms) {
         if (org.kind !== 'bacteria') continue;
         const d = junc.pos.distanceTo(org.pos);
         if (d < 25 && d < bestFoodD) {
           bestFoodD = d;
-          bestFoodDir = new THREE.Vector3().subVectors(org.pos, junc.pos).normalize();
+          this._tv3.subVectors(org.pos, junc.pos).normalize();
         }
       }
 
@@ -948,20 +946,23 @@ export class GameEngine3D {
         if (org.kind !== 'nematode') continue;
         const d = junc.pos.distanceTo(org.pos);
         if (d < 15) {
-          const repel = new THREE.Vector3().subVectors(junc.pos, org.pos).normalize();
-          if (toxinLvl > 0) attract.addScaledVector(repel, -1.5);  // токсины — атакуем
-          else attract.addScaledVector(repel, 2.0);  // убегаем
+          this._tv1.subVectors(junc.pos, org.pos).normalize();
+          if (toxinLvl > 0) attract.addScaledVector(this._tv1, -1.5);
+          else attract.addScaledVector(this._tv1, 2.0);
         }
       }
 
-      // случайный дрейф
-      const randDir = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+      // случайный дрейф — используем _tv1
+      this._tv1.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+      if (this._tv1.lengthSq() > 0) this._tv1.normalize();
       tip.dir.addScaledVector(attract, 0.16)
-               .addScaledVector(bestFoodDir, 0.2)
-               .addScaledVector(randDir, 0.36);
-      tip.dir = projectOnSurface(tip.dir, tip.surface).normalize();
+              .addScaledVector(this._tv3, 0.2)
+              .addScaledVector(this._tv1, 0.36);
+      projectOnSurface(tip.dir, tip.surface, tip.dir);
 
-      const newPos = junc.pos.clone().addScaledVector(tip.dir, speed * dt);
+      // newPos — переиспользуем _tv1
+      this._tv1.copy(junc.pos).addScaledVector(tip.dir, speed * dt);
+      const newPos = this._tv1;
 
       // проверяем переход на другую поверхность (ребро комнаты)
       const nextSurface = this.checkSurfaceTransition(newPos, tip.surface);
@@ -978,22 +979,24 @@ export class GameEngine3D {
       tip.len += speed * dt;
       if (tip.len > 1.4 && this.junctions.size < MAX_J && this.veins.size < MAX_V) {
         tip.len = 0;
-        const snapPos = this.snapToSurface(newPos, nextSurface);
-        const newJ = this.addJunction(snapPos, nextSurface);
+        // snapToSurface пишет в newPos (который это _tv1) — не создаём новый объект
+        this.snapToSurface(newPos, nextSurface, newPos);
+        const newJ = this.addJunction(newPos, nextSurface);
         this.addVein(tip.junctionId, newJ, 0.1 + Math.random() * 0.06);
         tip.junctionId = newJ;
         tip.surface = nextSurface;
-        tip.mesh.position.copy(snapPos);
+        tip.mesh.position.copy(newPos);
 
         // ветвление
         const branchProb = this.hasBuff('growth') ? 0.26 : 0.11;
         if (this.tips.length < MAX_T && Math.random() < branchProb) {
           const angle = (Math.random() - 0.5) * Math.PI * 0.75;
-          const bDir = tip.dir.clone().applyAxisAngle(surfaceNormal(nextSurface), angle);
-          this.addTip(newJ, bDir, nextSurface);
+          // applyAxisAngle не мутирует нормаль — берём _tv3 как bDir
+          this._tv3.copy(tip.dir).applyAxisAngle(SURFACE_NORMALS[nextSurface], angle);
+          this.addTip(newJ, this._tv3, nextSurface);
         }
       } else {
-        junc.pos.copy(this.snapToSurface(newPos, tip.surface));
+        this.snapToSurface(newPos, tip.surface, junc.pos);
         junc.mesh.position.copy(junc.pos);
         tip.mesh.position.copy(junc.pos);
       }
@@ -1007,10 +1010,15 @@ export class GameEngine3D {
     }
 
     if (this.tips.length < 2 && this.junctions.size > 0) {
-      const jArr = [...this.junctions.values()];
-      const j = jArr[Math.floor(Math.random() * jArr.length)];
-      const rDir = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5);
-      this.addTip(j.id, rDir, j.surface);
+      // берём случайный junction без создания массива
+      const keys = this.junctions.keys();
+      let j: Junction | undefined;
+      let skip = Math.floor(Math.random() * this.junctions.size);
+      for (const k of keys) { j = this.junctions.get(k); if (skip-- <= 0) break; }
+      if (j) {
+        this._tv1.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+        this.addTip(j.id, this._tv1, j.surface);
+      }
     }
   }
 
@@ -1037,9 +1045,10 @@ export class GameEngine3D {
     return cur;
   }
 
-  // привязать позицию к поверхности
-  snapToSurface(pos: THREE.Vector3, s: Surface): THREE.Vector3 {
-    const p = pos.clone();
+  // привязать позицию к поверхности — пишет в out (без new Vector3)
+  snapToSurface(pos: THREE.Vector3, s: Surface, out?: THREE.Vector3): THREE.Vector3 {
+    const p = out ?? pos;
+    if (p !== pos) p.copy(pos);
     const off = 0.02;
     switch (s) {
       case 'floor':   p.y = off; break;
@@ -1063,9 +1072,35 @@ export class GameEngine3D {
   }
 
   tryPruneJ(jId: number) {
-    for (const [, v] of this.veins) if (v.a === jId || v.b === jId) return;
+    const set = this.veinsByJ.get(jId);
+    if (set && set.size > 0) return;
     if (this.tips.some(t => t.junctionId === jId)) return;
     this.removeJunction(jId);
+  }
+
+  // ─── капли протоплазмы (главный loop, без вложенного RAF) ────────────────
+
+  updateDrops(dt: number) {
+    for (let i = this.drops.length - 1; i >= 0; i--) {
+      const d = this.drops[i];
+      d.t += dt * 2.2;  // ~0.45с на проход
+      if (d.t >= 1) {
+        this.scene.remove(d.mesh);
+        this.disposeObject(d.mesh);
+        this.drops.splice(i, 1);
+        continue;
+      }
+      const ja = this.junctions.get(d.veinA);
+      const jb = this.junctions.get(d.veinB);
+      if (!ja || !jb) {
+        this.scene.remove(d.mesh);
+        this.disposeObject(d.mesh);
+        this.drops.splice(i, 1);
+        continue;
+      }
+      const frac = d.dir > 0 ? d.t : 1 - d.t;
+      d.mesh.position.lerpVectors(ja.pos, jb.pos, frac);
+    }
   }
 
   // ─── организмы ────────────────────────────────────────────────────────────
@@ -1234,17 +1269,20 @@ export class GameEngine3D {
   // ─── волны осязания ───────────────────────────────────────────────────────
 
   emitWaves() {
+    // Волна — один базовый RingGeometry r=1, масштабируем через mesh.scale
     const jArr = [...this.junctions.values()];
     const step = Math.max(1, Math.floor(jArr.length / 10));
     for (let i = 0; i < jArr.length; i += step) {
       const j = jArr[i];
-      const geo = new THREE.RingGeometry(0.05, 0.15, 48);
-      const mat = new THREE.MeshBasicMaterial({ color: COL_WAVE, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+      // базовая геометрия кольца радиусом 1 — масштабируем в updateWaves
+      const geo = new THREE.RingGeometry(0.9, 1.0, 48);
+      const mat = new THREE.MeshBasicMaterial({ color: C_WAVE, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
       const mesh = new THREE.Mesh(geo, mat);
+      mesh.scale.setScalar(0.05);
 
       // ориентируем кольцо по нормали поверхности
-      const n = surfaceNormal(j.surface);
-      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+      const n = SURFACE_NORMALS[j.surface];
+      mesh.quaternion.setFromUnitVectors(_yUp, n);
       mesh.position.copy(j.pos).addScaledVector(n, 0.05);
       this.scene.add(mesh);
 
@@ -1261,13 +1299,11 @@ export class GameEngine3D {
       const w = this.waves[i];
       w.radius += waveSpeed * dt;
       w.life -= dt;
-      const alpha = (w.life / 1.8) * 0.45;
-      const mat = w.mesh.material as THREE.MeshBasicMaterial;
-      mat.opacity = alpha;
-      w.mesh.geometry.dispose();
-      w.mesh.geometry = new THREE.RingGeometry(w.radius - 0.1, w.radius + 0.1, 52);
 
-      // проверяем что волна касается
+      // scale вместо пересоздания геометрии — ключевая оптимизация
+      w.mesh.scale.setScalar(w.radius);
+      (w.mesh.material as THREE.MeshBasicMaterial).opacity = (w.life / 1.8) * 0.45;
+
       this.checkWaveReveal(w);
 
       if (w.life <= 0 || w.radius > waveRange) {
@@ -1426,5 +1462,3 @@ export class GameEngine3D {
   head() { return { x: this.blobPos.x, z: this.blobPos.z }; }
 }
 
-// константа цвета волн (нужна в движке)
-const COL_WAVE = new THREE.Color(0.78, 0.97, 1.0);
