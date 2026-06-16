@@ -1,64 +1,84 @@
 /**
- * Physarum polycephalum — 3D движок
+ * Physarum polycephalum — 3D движок v3
  *
- * - Карта 3D: объекты лаборатории расставлены в пространстве (стеллажи, приборы)
- * - Физарум 2D: сеть веин лежит на плоскости Y=0 (как в реальности на агаре)
- * - Камера: OrbitControls — вращение мышью/тачем, зум скроллом/щипком
- * - Управление: клик на плоскость → аттрактант → псевдоподии тянутся туда
- * - Волны осязания: кольца на плоскости Y=0, при пересечении 3D-объектов их подсвечивают
+ * Биологическая модель:
+ * - Гибрид: центральное пятно-плазмодий + толстые вейны + тонкие псевдоподии
+ * - Рост по ТРЁМ поверхностям: пол (Y=0), стены (X=±W, Z=±D), потолок (Y=H)
+ * - Мутации от элементов: Глаза / Жгутики / Токсины / Споры
+ * - Организмы: Бактерии (еда), Грибки (конкуренты, блокируют путь), Нематоды (враги)
+ * - Интерьер лаборатории с ползабельными объектами
  */
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { ELEMENTS, BUFF_META, EXPERIMENTS, STRUCTURE_TYPES, ESCAPE_ENERGY, ESCAPE_SIZE } from './data';
-import { Buff, ExperimentEvent, Food, GamePhase } from './types';
+import { ELEMENTS, BUFF_META, EXPERIMENTS } from './data';
+import { Buff, ExperimentEvent, GamePhase } from './types';
 
-// ─── типы графа физарума ──────────────────────────────────────────────────────
+// ─── типы ─────────────────────────────────────────────────────────────────────
 
-interface Junction {
+export type Surface = 'floor' | 'wall_px' | 'wall_nx' | 'wall_pz' | 'wall_nz' | 'ceiling';
+
+export interface Junction {
   id: number;
-  x: number; z: number;   // Y всегда 0
+  pos: THREE.Vector3;   // мировая позиция
+  surface: Surface;
   nutrient: number;
   mesh: THREE.Mesh;
 }
 
-interface Vein {
+export interface Vein {
   id: number;
   a: number; b: number;
   radius: number;
   flow: number;
   phase: number;
   age: number;
-  line: THREE.Mesh;        // CylinderGeometry между двумя точками
+  mesh: THREE.Mesh;
 }
 
-interface Tip {
+export interface Tip {
   id: number;
   junctionId: number;
-  dx: number; dz: number;
+  dir: THREE.Vector3;   // направление на поверхности
+  surface: Surface;
   energy: number;
   len: number;
   mesh: THREE.Mesh;
 }
 
-interface WaveRing {
+export interface WaveRing {
+  pos: THREE.Vector3;
+  surface: Surface;
   radius: number;
   life: number;
-  x: number; z: number;
   mesh: THREE.Mesh;
 }
 
-interface LabObject {
-  mesh: THREE.Group;
-  x: number; z: number;
-  w: number; d: number;
-  h: number;
-  label: string;
-  revealed: boolean;
-  labelSprite: THREE.Sprite;
+export interface Organism {
+  id: number;
+  kind: 'bacteria' | 'fungus' | 'nematode';
+  pos: THREE.Vector3;
+  hp: number;
+  mesh: THREE.Mesh;
+  vx: number; vz: number;  // для нематод
+  phase: number;
 }
 
-// ─── публичный state ──────────────────────────────────────────────────────────
+export interface LabObject {
+  mesh: THREE.Group;
+  pos: THREE.Vector3;
+  size: THREE.Vector3;
+  label: string;
+  revealed: boolean;
+  surfaces: Surface[];  // поверхности на которых растёт
+}
+
+// мутации
+export type MutationType = 'eyes' | 'flagella' | 'toxin' | 'spores';
+export interface Mutation {
+  type: MutationType;
+  level: number;  // 1-3
+}
 
 export interface GameState {
   phase: GamePhase;
@@ -69,48 +89,56 @@ export interface GameState {
   buffs: Buff[];
   experiment: ExperimentEvent | null;
   freedom: boolean;
+  mutations: Mutation[];
+  surface: Surface;
 }
 
 export interface EngineCallbacks {
   onState: (s: GameState) => void;
   onEvent: (e: ExperimentEvent) => void;
   onAchievement: (id: string) => void;
-  onElementEaten: (rare: boolean) => void;
+  onElementEaten: (rare: boolean, symbol: string) => void;
+  onMutation: (m: Mutation) => void;
+  onKill: (kind: string) => void;
 }
 
-// ─── константы ───────────────────────────────────────────────────────────────
+// ─── константы ────────────────────────────────────────────────────────────────
 
-const TUBE_HALF = 18;          // половина стороны пробирки в мировых единицах
-const MAX_JUNCTIONS = 500;
-const MAX_VEINS = 700;
-const MAX_TIPS = 24;
-const TIP_SPEED = 3.2;
+const LAB_W = 60;   // ширина лаборатории
+const LAB_H = 22;   // высота
+const LAB_D = 80;   // глубина
+
+const TUBE_HALF = 16;
+
+const MAX_J = 600;
+const MAX_V = 900;
+const MAX_T = 32;
+const TIP_SPEED = 3.8;
 const PULSE_FREQ = 1.4;
-const RETRACT_R = 0.04;
-const MAX_RADIUS = 1.1;
-const GROW_RATE = 0.022;
-const DECAY_RATE = 0.009;
+const RETRACT_R = 0.035;
+const MAX_R = 1.2;
+const GROW_R = 0.025;
+const DECAY_R = 0.01;
 
-// цвета физарума
-const COL_VEIN = new THREE.Color(0.72, 0.90, 0.22);      // охра-жёлтый
-const COL_CORE = new THREE.Color(0.90, 1.0, 0.55);
-const COL_TIP  = new THREE.Color(0.85, 1.0, 0.30);
-const COL_WAVE = new THREE.Color(0.78, 0.97, 1.0);
-const COL_MEGA = new THREE.Color(1.0, 0.85, 0.15);
+// Цвета физарума
+const C_BODY   = new THREE.Color(0.85, 0.75, 0.10);
+const C_VEIN   = new THREE.Color(0.78, 0.88, 0.18);
+const C_CORE   = new THREE.Color(0.95, 1.00, 0.50);
+const C_TIP    = new THREE.Color(0.90, 1.00, 0.25);
+const C_MEGA   = new THREE.Color(1.00, 0.82, 0.10);
 
 let _id = 0;
 const uid = () => ++_id;
 
-// ─── вспомогательные функции Three.js ────────────────────────────────────────
+// ─── утилиты Three.js ─────────────────────────────────────────────────────────
 
-function makeTube(ax: number, az: number, bx: number, bz: number, r: number, mat: THREE.Material): THREE.Mesh {
-  const dx = bx - ax, dz = bz - az;
-  const len = Math.hypot(dx, dz) || 0.01;
-  const geo = new THREE.CylinderGeometry(r, r, len, 6, 1);
+function makeCylinder(pa: THREE.Vector3, pb: THREE.Vector3, r: number, mat: THREE.Material): THREE.Mesh {
+  const dir = new THREE.Vector3().subVectors(pb, pa);
+  const len = dir.length() || 0.01;
+  const geo = new THREE.CylinderGeometry(r, r, len, 7, 1);
   const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set((ax + bx) / 2, 0, (az + bz) / 2);
-  mesh.rotation.z = Math.PI / 2;
-  mesh.rotation.y = -Math.atan2(dz, dx);
+  mesh.position.copy(pa).addScaledVector(dir.normalize(), len / 2);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
   return mesh;
 }
 
@@ -118,31 +146,47 @@ function makeSphere(r: number, mat: THREE.Material): THREE.Mesh {
   return new THREE.Mesh(new THREE.SphereGeometry(r, 8, 8), mat);
 }
 
-function makeWaveRing(x: number, z: number, r: number, scene: THREE.Scene): WaveRing {
-  const geo = new THREE.RingGeometry(r - 0.05, r + 0.05, 48);
-  const mat = new THREE.MeshBasicMaterial({ color: COL_WAVE, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.set(x, 0.02, z);
-  scene.add(mesh);
-  return { radius: r, life: 1.8, x, z, mesh };
+// получить нормаль поверхности
+function surfaceNormal(s: Surface): THREE.Vector3 {
+  switch (s) {
+    case 'floor':   return new THREE.Vector3(0, 1, 0);
+    case 'ceiling': return new THREE.Vector3(0, -1, 0);
+    case 'wall_px': return new THREE.Vector3(-1, 0, 0);
+    case 'wall_nx': return new THREE.Vector3(1, 0, 0);
+    case 'wall_pz': return new THREE.Vector3(0, 0, -1);
+    case 'wall_nz': return new THREE.Vector3(0, 0, 1);
+  }
 }
 
-function makeLabelSprite(text: string): THREE.Sprite {
-  const canvas = document.createElement('canvas');
-  canvas.width = 256; canvas.height = 64;
-  const ctx = canvas.getContext('2d')!;
-  ctx.fillStyle = 'rgba(0,0,0,0)';
-  ctx.fillRect(0, 0, 256, 64);
-  ctx.font = 'bold 20px JetBrains Mono, monospace';
-  ctx.fillStyle = '#9fe8ff';
-  ctx.textAlign = 'center';
-  ctx.fillText(text, 128, 40);
-  const tex = new THREE.CanvasTexture(canvas);
-  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 0 });
-  const sprite = new THREE.Sprite(mat);
-  sprite.scale.set(8, 2, 1);
-  return sprite;
+// спроецировать вектор движения на плоскость поверхности
+function projectOnSurface(dir: THREE.Vector3, s: Surface): THREE.Vector3 {
+  const n = surfaceNormal(s);
+  return dir.clone().addScaledVector(n, -dir.dot(n)).normalize();
+}
+
+// начальная позиция на поверхности
+function surfacePosition(s: Surface, u: number, v: number): THREE.Vector3 {
+  switch (s) {
+    case 'floor':   return new THREE.Vector3(u, 0.02, v);
+    case 'ceiling': return new THREE.Vector3(u, LAB_H - 0.02, v);
+    case 'wall_px': return new THREE.Vector3(LAB_W / 2 - 0.02, u, v);
+    case 'wall_nx': return new THREE.Vector3(-LAB_W / 2 + 0.02, u, v);
+    case 'wall_pz': return new THREE.Vector3(u, v, LAB_D / 2 - 0.02);
+    case 'wall_nz': return new THREE.Vector3(u, v, -LAB_D / 2 + 0.02);
+  }
+}
+
+// остаётся ли позиция на поверхности (в пределах стен/пола)
+function onSurface(pos: THREE.Vector3, s: Surface): boolean {
+  const h = LAB_H, w = LAB_W / 2, d = LAB_D / 2;
+  switch (s) {
+    case 'floor':
+    case 'ceiling': return Math.abs(pos.x) < w && Math.abs(pos.z) < d;
+    case 'wall_px':
+    case 'wall_nx': return pos.y > 0 && pos.y < h && Math.abs(pos.z) < d;
+    case 'wall_pz':
+    case 'wall_nz': return pos.y > 0 && pos.y < h && Math.abs(pos.x) < w;
+  }
 }
 
 // ─── главный движок ───────────────────────────────────────────────────────────
@@ -159,29 +203,35 @@ export class GameEngine3D {
   junctions = new Map<number, Junction>();
   veins = new Map<number, Vein>();
   tips: Tip[] = [];
-  waveRings: WaveRing[] = [];
-  foods3d: { food: Food; mesh: THREE.Mesh; revealed: boolean }[] = [];
+  waves: WaveRing[] = [];
+  organisms: Organism[] = [];
   labObjects: LabObject[] = [];
 
-  // материалы (переиспользуем)
+  // центральное пятно-плазмодий
+  blobMesh!: THREE.Mesh;
+  blobPos = new THREE.Vector3(0, 0.05, 0);
+
+  // материалы
   matVein!: THREE.MeshStandardMaterial;
-  matCore!: THREE.MeshBasicMaterial;
   matTip!: THREE.MeshStandardMaterial;
   matJunc!: THREE.MeshStandardMaterial;
-  matFloor!: THREE.MeshStandardMaterial;
-  matTubeWall!: THREE.MeshPhysicalMaterial;
+  matBlob!: THREE.MeshStandardMaterial;
 
-  target = { x: 0, z: 0 };
   targetMarker!: THREE.Mesh;
+  targetPos = new THREE.Vector3(0, 0, 0);
 
   phase: GamePhase = 'tube';
-  energy = 72;
+  energy = 75;
   freedom = false;
   elementsEaten = 0;
   bestSize = 0;
   buffs: Buff[] = [];
+  mutations: Mutation[] = [];
   experiment: ExperimentEvent | null = null;
-  scratches: { x1: number; z1: number; x2: number; z2: number }[] = [];
+  currentSurface: Surface = 'floor';
+
+  // статистика убийств
+  kills = { bacteria: 0, fungus: 0, nematode: 0 };
 
   raf = 0;
   running = false;
@@ -189,10 +239,13 @@ export class GameEngine3D {
   waveTimer = 0;
   experimentTimer = 0;
   foodTimer = 0;
+  orgTimer = 0;
   breakT = 0;
+  t = 0;
 
   raycaster = new THREE.Raycaster();
-  groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  // плоскости для raycast по поверхностям
+  planes: { surface: Surface; plane: THREE.Plane }[] = [];
 
   constructor(canvas: HTMLCanvasElement, cb: EngineCallbacks) {
     this.canvas = canvas;
@@ -201,11 +254,10 @@ export class GameEngine3D {
     this.reset();
   }
 
-  // ─── инициализация Three.js ───────────────────────────────────────────────
+  // ─── Three.js init ────────────────────────────────────────────────────────
 
   initThree() {
-    const W = this.canvas.clientWidth;
-    const H = this.canvas.clientHeight;
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true, powerPreference: 'high-performance' });
@@ -215,217 +267,447 @@ export class GameEngine3D {
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.1;
+    this.renderer.toneMappingExposure = 1.15;
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x04070d, 0.018);
+    this.scene.fog = new THREE.FogExp2(0x030912, 0.012);
 
-    this.camera = new THREE.PerspectiveCamera(55, W / H, 0.1, 1000);
-    this.camera.position.set(0, 38, 52);
-    this.camera.lookAt(0, 0, 0);
+    this.camera = new THREE.PerspectiveCamera(58, W / H, 0.1, 600);
+    this.camera.position.set(0, 42, 58);
 
     this.controls = new OrbitControls(this.camera, this.canvas);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
-    this.controls.minDistance = 6;
-    this.controls.maxDistance = 180;
-    this.controls.maxPolarAngle = Math.PI / 2.1;
+    this.controls.dampingFactor = 0.07;
+    this.controls.minDistance = 5;
+    this.controls.maxDistance = 220;
     this.controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_ROTATE };
 
-    // материалы
-    this.matVein = new THREE.MeshStandardMaterial({ color: COL_VEIN, emissive: COL_VEIN, emissiveIntensity: 0.4, roughness: 0.5, metalness: 0.1 });
-    this.matCore = new THREE.MeshBasicMaterial({ color: COL_CORE });
-    this.matTip  = new THREE.MeshStandardMaterial({ color: COL_TIP, emissive: COL_TIP, emissiveIntensity: 0.8, roughness: 0.3 });
-    this.matJunc = new THREE.MeshStandardMaterial({ color: COL_VEIN, emissive: COL_VEIN, emissiveIntensity: 0.5, roughness: 0.4 });
-    this.matFloor = new THREE.MeshStandardMaterial({ color: 0x0d1f1a, roughness: 0.9, metalness: 0.05 });
-    this.matTubeWall = new THREE.MeshPhysicalMaterial({
-      color: 0x88ddff, transparent: true, opacity: 0.13,
-      roughness: 0.05, metalness: 0.0, transmission: 0.88,
-      side: THREE.DoubleSide,
-    });
+    // Материалы
+    this.matVein = new THREE.MeshStandardMaterial({ color: C_VEIN, emissive: C_VEIN, emissiveIntensity: 0.45, roughness: 0.4, metalness: 0.0, transparent: true, opacity: 0.88 });
+    this.matTip  = new THREE.MeshStandardMaterial({ color: C_TIP, emissive: C_TIP, emissiveIntensity: 0.9, roughness: 0.3 });
+    this.matJunc = new THREE.MeshStandardMaterial({ color: C_VEIN, emissive: C_VEIN, emissiveIntensity: 0.5, roughness: 0.4 });
+    this.matBlob = new THREE.MeshStandardMaterial({ color: C_BODY, emissive: C_BODY, emissiveIntensity: 0.5, roughness: 0.55, metalness: 0.05, transparent: true, opacity: 0.82 });
 
-    // освещение
-    const ambient = new THREE.AmbientLight(0x0a1820, 1.2);
-    this.scene.add(ambient);
+    // Освещение
+    this.scene.add(new THREE.AmbientLight(0x0a1520, 1.4));
 
-    const sun = new THREE.DirectionalLight(0x5feedd, 1.8);
-    sun.position.set(20, 50, 30);
+    const sun = new THREE.DirectionalLight(0x88ddcc, 2.0);
+    sun.position.set(20, 40, 20);
     sun.castShadow = true;
     sun.shadow.mapSize.set(1024, 1024);
     this.scene.add(sun);
 
-    const fill = new THREE.PointLight(0x2244aa, 1.2, 200);
-    fill.position.set(-30, 20, -30);
+    const fill = new THREE.PointLight(0x1133aa, 1.5, 300);
+    fill.position.set(-30, 15, -20);
     this.scene.add(fill);
 
-    // маркер цели (куда тянется физарум)
-    const markerGeo = new THREE.RingGeometry(0.3, 0.5, 24);
-    const markerMat = new THREE.MeshBasicMaterial({ color: 0xb0ffb0, transparent: true, opacity: 0.7, side: THREE.DoubleSide });
-    this.targetMarker = new THREE.Mesh(markerGeo, markerMat);
-    this.targetMarker.rotation.x = -Math.PI / 2;
-    this.targetMarker.position.y = 0.03;
+    // Маркер цели
+    const mg = new THREE.RingGeometry(0.25, 0.45, 24);
+    const mm = new THREE.MeshBasicMaterial({ color: 0xaaffaa, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthTest: false });
+    this.targetMarker = new THREE.Mesh(mg, mm);
     this.scene.add(this.targetMarker);
 
-    // фоновая сетка
-    const grid = new THREE.GridHelper(400, 80, 0x0a2030, 0x061420);
-    grid.position.y = -0.01;
-    this.scene.add(grid);
+    // planes для raycast
+    this.planes = [
+      { surface: 'floor',   plane: new THREE.Plane(new THREE.Vector3(0,1,0), 0) },
+      { surface: 'ceiling', plane: new THREE.Plane(new THREE.Vector3(0,-1,0), -LAB_H) },
+      { surface: 'wall_px', plane: new THREE.Plane(new THREE.Vector3(-1,0,0), -LAB_W/2) },
+      { surface: 'wall_nx', plane: new THREE.Plane(new THREE.Vector3(1,0,0), -LAB_W/2) },
+      { surface: 'wall_pz', plane: new THREE.Plane(new THREE.Vector3(0,0,-1), -LAB_D/2) },
+      { surface: 'wall_nz', plane: new THREE.Plane(new THREE.Vector3(0,0,1), -LAB_D/2) },
+    ];
   }
 
-  // ─── сброс / инициализация мира ───────────────────────────────────────────
+  // ─── reset ────────────────────────────────────────────────────────────────
 
   reset() {
     _id = 0;
     this.phase = 'tube';
-    this.energy = 72;
+    this.energy = 75;
     this.freedom = false;
     this.elementsEaten = 0;
     this.breakT = 0;
     this.buffs = [];
+    this.mutations = [];
     this.experiment = null;
+    this.currentSurface = 'floor';
     this.waveTimer = 0;
     this.experimentTimer = 0;
     this.foodTimer = 0;
-    this.target = { x: 0, z: 0 };
+    this.orgTimer = 0;
+    this.kills = { bacteria: 0, fungus: 0, nematode: 0 };
 
-    // чистим сцену (кроме grid, освещения, маркера)
-    const keep = new Set<THREE.Object3D>();
-    this.scene.traverse(o => {
-      if (o instanceof THREE.GridHelper || o instanceof THREE.Light || o === this.targetMarker) keep.add(o);
-    });
+    // чистим сцену
     const toRemove: THREE.Object3D[] = [];
-    this.scene.children.forEach(c => { if (!keep.has(c)) toRemove.push(c); });
-    toRemove.forEach(c => { this.scene.remove(c); });
+    this.scene.children.forEach(c => {
+      if (!(c instanceof THREE.Light)) toRemove.push(c);
+    });
+    toRemove.forEach(c => this.disposeObject(c));
+    this.scene.children.forEach(c => { if (!(c instanceof THREE.Light)) this.scene.remove(c); });
 
     this.junctions.clear();
     this.veins.clear();
     this.tips = [];
-    this.waveRings = [];
-    this.foods3d = [];
+    this.waves = [];
+    this.organisms = [];
     this.labObjects = [];
 
-    this.buildTube();
-    this.buildFloor();
+    // маркер цели
+    this.scene.add(this.targetMarker);
+
+    this.buildLab();
+    this.buildBlob();
     this.seedNetwork();
+    this.spawnOrganisms(8, 'bacteria');
 
-    for (let i = 0; i < 4; i++) this.spawnPellet();
-    this.pushState();
-
-    this.camera.position.set(0, 38, 52);
-    this.controls.target.set(0, 0, 0);
+    this.camera.position.set(0, 42, 58);
+    this.controls.target.set(0, 5, 0);
     this.controls.update();
+
+    this.pushState();
   }
 
-  buildFloor() {
-    const geo = new THREE.PlaneGeometry(400, 400);
-    const mesh = new THREE.Mesh(geo, this.matFloor);
-    mesh.rotation.x = -Math.PI / 2;
-    mesh.position.y = -0.05;
-    mesh.receiveShadow = true;
-    this.scene.add(mesh);
+  disposeObject(obj: THREE.Object3D) {
+    obj.traverse(c => {
+      const m = c as THREE.Mesh;
+      if (m.geometry) m.geometry.dispose();
+      if (m.material) {
+        if (Array.isArray(m.material)) m.material.forEach(mt => mt.dispose());
+        else (m.material as THREE.Material).dispose();
+      }
+    });
+  }
+
+  // ─── лаборатория ─────────────────────────────────────────────────────────
+
+  buildLab() {
+    const W = LAB_W, H = LAB_H, D = LAB_D;
+    const hw = W / 2, hd = D / 2;
+
+    // материалы стен
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0x0d1e1a, roughness: 0.9, metalness: 0.05, side: THREE.BackSide });
+    const room = new THREE.Mesh(new THREE.BoxGeometry(W, H, D), wallMat);
+    room.position.set(0, H / 2, 0);
+    room.receiveShadow = true;
+    this.scene.add(room);
+
+    // пол — агаровая пластина
+    const floorMat = new THREE.MeshStandardMaterial({ color: 0x1a2e1a, roughness: 0.8, metalness: 0.02 });
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    this.scene.add(floor);
+
+    // сетка пола
+    const grid = new THREE.GridHelper(W, 24, 0x0a2018, 0x061410);
+    grid.position.y = 0.01;
+    this.scene.add(grid);
+
+    // лабораторные объекты
+    this.addLabObject('microscope',  new THREE.Vector3(-22, 0, -28), new THREE.Vector3(5, 12, 5));
+    this.addLabObject('microscope',  new THREE.Vector3(20, 0, -32), new THREE.Vector3(5, 12, 5));
+    this.addLabObject('fridge',      new THREE.Vector3(-hw + 3, 0, -15), new THREE.Vector3(6, 14, 5));
+    this.addLabObject('fridge',      new THREE.Vector3(-hw + 3, 0, 10), new THREE.Vector3(6, 14, 5));
+    this.addLabObject('shelf',       new THREE.Vector3(hw - 3, 0, -20), new THREE.Vector3(4, 18, 8));
+    this.addLabObject('shelf',       new THREE.Vector3(hw - 3, 0, 15), new THREE.Vector3(4, 18, 8));
+    this.addLabObject('bench',       new THREE.Vector3(-10, 0, 30), new THREE.Vector3(20, 5, 6));
+    this.addLabObject('bench',       new THREE.Vector3(12, 0, 30), new THREE.Vector3(16, 5, 6));
+    this.addLabObject('centrifuge',  new THREE.Vector3(5, 0, -30), new THREE.Vector3(4, 6, 4));
+    this.addLabObject('incubator',   new THREE.Vector3(-5, 0, -30), new THREE.Vector3(7, 9, 6));
+    this.addLabObject('petri_rack',  new THREE.Vector3(0, 0, 25), new THREE.Vector3(8, 3, 5));
+    this.addLabObject('computer',    new THREE.Vector3(-18, 0, 28), new THREE.Vector3(5, 8, 3));
+
+    // пробирка (в начале игры)
+    this.buildTube();
+
+    // лампы на потолке
+    for (let i = -1; i <= 1; i++) {
+      const lamp = new THREE.PointLight(0xccffee, 1.8, 60);
+      lamp.position.set(i * 18, H - 1, 0);
+      this.scene.add(lamp);
+      const lampMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(6, 0.4, 1.5),
+        new THREE.MeshStandardMaterial({ color: 0xaaffdd, emissive: 0x44ffaa, emissiveIntensity: 1.2 })
+      );
+      lampMesh.position.set(i * 18, H - 0.3, 0);
+      this.scene.add(lampMesh);
+    }
+  }
+
+  addLabObject(type: string, pos: THREE.Vector3, size: THREE.Vector3) {
+    const group = new THREE.Group();
+    const mat = new THREE.MeshStandardMaterial({ color: 0x1a3030, roughness: 0.7, metalness: 0.3 });
+    const matMetal = new THREE.MeshStandardMaterial({ color: 0x445566, roughness: 0.3, metalness: 0.8 });
+    const matGlass = new THREE.MeshStandardMaterial({ color: 0x88ccff, transparent: true, opacity: 0.35, roughness: 0.05 });
+    const matScreen = new THREE.MeshStandardMaterial({ color: 0x002200, emissive: 0x00ff44, emissiveIntensity: 0.4 });
+
+    switch (type) {
+      case 'microscope': {
+        // основание
+        const base = new THREE.Mesh(new THREE.BoxGeometry(size.x, 1, size.z), mat.clone());
+        base.position.y = 0.5;
+        group.add(base);
+        // колонна
+        const col = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.6, size.y * 0.7, 10), matMetal.clone());
+        col.position.y = size.y * 0.35 + 1;
+        group.add(col);
+        // объектив
+        const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.5, 1.5, 10), matMetal.clone());
+        lens.position.set(1.2, size.y * 0.6, 0);
+        lens.rotation.z = Math.PI / 2;
+        group.add(lens);
+        // окуляр
+        const eye = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.3, 2, 10), matMetal.clone());
+        eye.position.set(0, size.y + 1, 0);
+        group.add(eye);
+        break;
+      }
+      case 'fridge': {
+        const body = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), mat.clone());
+        body.position.y = size.y / 2;
+        group.add(body);
+        const door = new THREE.Mesh(new THREE.BoxGeometry(size.x - 0.2, size.y * 0.95, 0.15), matMetal.clone());
+        door.position.set(0, size.y / 2, size.z / 2 + 0.05);
+        group.add(door);
+        const handle = new THREE.Mesh(new THREE.BoxGeometry(0.15, size.y * 0.4, 0.2), matMetal.clone());
+        handle.position.set(size.x * 0.35, size.y / 2, size.z / 2 + 0.2);
+        group.add(handle);
+        // подсветка синяя
+        const light = new THREE.PointLight(0x0066ff, 0.8, 8);
+        light.position.set(0, size.y * 0.6, size.z * 0.3);
+        group.add(light);
+        break;
+      }
+      case 'shelf': {
+        // стойки
+        for (let sx = -1; sx <= 1; sx += 2) {
+          const pole = new THREE.Mesh(new THREE.BoxGeometry(0.3, size.y, 0.3), matMetal.clone());
+          pole.position.set(sx * size.x / 2, size.y / 2, 0);
+          group.add(pole);
+        }
+        // полки
+        for (let i = 0; i < 4; i++) {
+          const shelf = new THREE.Mesh(new THREE.BoxGeometry(size.x, 0.2, size.z), mat.clone());
+          shelf.position.y = (i + 1) * size.y / 4.5;
+          group.add(shelf);
+          // пробирки на полке
+          for (let t = 0; t < 5; t++) {
+            const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 1.2, 8), matGlass.clone());
+            tube.position.set(-size.x / 2 + 0.5 + t * 0.9, shelf.position.y + 0.7, 0);
+            group.add(tube);
+          }
+        }
+        break;
+      }
+      case 'bench': {
+        const top = new THREE.Mesh(new THREE.BoxGeometry(size.x, 0.4, size.z), matMetal.clone());
+        top.position.y = size.y;
+        group.add(top);
+        for (let lx = -1; lx <= 1; lx += 2) {
+          for (let lz = -1; lz <= 1; lz += 2) {
+            const leg = new THREE.Mesh(new THREE.BoxGeometry(0.3, size.y, 0.3), mat.clone());
+            leg.position.set(lx * (size.x / 2 - 0.5), size.y / 2, lz * (size.z / 2 - 0.5));
+            group.add(leg);
+          }
+        }
+        // чашки Петри на столе
+        for (let p = 0; p < 4; p++) {
+          const petri = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.2, 0.3, 16), matGlass.clone());
+          petri.position.set(-size.x / 2 + 2 + p * 3.5, size.y + 0.25, 0);
+          group.add(petri);
+        }
+        break;
+      }
+      case 'centrifuge': {
+        const body = new THREE.Mesh(new THREE.CylinderGeometry(size.x / 2, size.x / 2, size.y, 14), mat.clone());
+        body.position.y = size.y / 2;
+        group.add(body);
+        const rotor = new THREE.Mesh(new THREE.CylinderGeometry(size.x * 0.38, size.x * 0.38, 0.5, 12), matMetal.clone());
+        rotor.position.y = size.y + 0.1;
+        group.add(rotor);
+        for (let i = 0; i < 6; i++) {
+          const a = (i / 6) * Math.PI * 2;
+          const slot = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 1, 6), matMetal.clone());
+          slot.position.set(Math.cos(a) * size.x * 0.25, size.y + 0.1, Math.sin(a) * size.x * 0.25);
+          slot.rotation.x = Math.PI / 4;
+          group.add(slot);
+        }
+        break;
+      }
+      case 'incubator': {
+        const body = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), mat.clone());
+        body.position.y = size.y / 2;
+        group.add(body);
+        const window_ = new THREE.Mesh(new THREE.BoxGeometry(size.x * 0.6, size.y * 0.5, 0.15), matGlass.clone());
+        window_.position.set(0, size.y * 0.55, size.z / 2 + 0.05);
+        group.add(window_);
+        const glow = new THREE.PointLight(0xff6600, 0.8, 6);
+        glow.position.set(0, size.y / 2, 0);
+        group.add(glow);
+        break;
+      }
+      case 'petri_rack': {
+        const rack = new THREE.Mesh(new THREE.BoxGeometry(size.x, 0.3, size.z), mat.clone());
+        rack.position.y = 0.15;
+        group.add(rack);
+        for (let px = -1; px <= 1; px++) {
+          for (let pz = -1; pz <= 1; pz += 2) {
+            const p = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.0, 0.35, 16), matGlass.clone());
+            p.position.set(px * 2.2, 0.4, pz * 1.2);
+            group.add(p);
+            // содержимое - цветная агара
+            const agar = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 0.9, 0.15, 16),
+              new THREE.MeshStandardMaterial({ color: px === 0 ? 0x88ff44 : 0xff8844, transparent: true, opacity: 0.6 }));
+            agar.position.set(px * 2.2, 0.4, pz * 1.2);
+            group.add(agar);
+          }
+        }
+        break;
+      }
+      case 'computer': {
+        const body = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y * 0.6, size.z), mat.clone());
+        body.position.y = size.y * 0.3;
+        group.add(body);
+        const monitor = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y * 0.5, 0.2), matScreen.clone());
+        monitor.position.set(0, size.y * 0.8, -size.z * 0.3);
+        monitor.rotation.x = -0.15;
+        group.add(monitor);
+        // данные на экране
+        const screenGlow = new THREE.PointLight(0x00ff44, 0.6, 4);
+        screenGlow.position.copy(monitor.position);
+        group.add(screenGlow);
+        break;
+      }
+      default: {
+        const b = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), mat.clone());
+        b.position.y = size.y / 2;
+        group.add(b);
+      }
+    }
+
+    group.position.copy(pos);
+    group.traverse(c => { (c as THREE.Mesh).castShadow = true; (c as THREE.Mesh).receiveShadow = true; });
+    this.scene.add(group);
+
+    this.labObjects.push({
+      mesh: group, pos: pos.clone(), size, label: type, revealed: false,
+      surfaces: ['floor'],
+    });
   }
 
   buildTube() {
-    const h = TUBE_HALF;
-    const wallH = 6;
-    const wallMat = this.matTubeWall;
-    const edges: [number, number, number, number, number, number][] = [
-      // x, y, z, rx, ry, rz
-      [0, wallH / 2, -h, 0, 0, 0],
-      [0, wallH / 2,  h, 0, 0, 0],
-      [-h, wallH / 2, 0, 0, Math.PI / 2, 0],
-      [ h, wallH / 2, 0, 0, Math.PI / 2, 0],
-    ];
-    for (const [x, y, z, rx, ry, rz] of edges) {
-      const geo = new THREE.PlaneGeometry(h * 2, wallH);
-      const wall = new THREE.Mesh(geo, wallMat);
-      wall.position.set(x, y, z);
-      wall.rotation.set(rx, ry, rz);
+    const s = TUBE_HALF * 2;
+    const h = 10;
+    const glassM = new THREE.MeshPhysicalMaterial({
+      color: 0x88ddff, transparent: true, opacity: 0.12,
+      roughness: 0.02, transmission: 0.9, side: THREE.DoubleSide,
+    });
+    const edgeM = new THREE.LineBasicMaterial({ color: 0x88ddff, transparent: true, opacity: 0.5 });
+
+    // стены пробирки
+    for (const [dx, dz, ry] of [[0, -1, 0], [0, 1, Math.PI], [-1, 0, Math.PI / 2], [1, 0, -Math.PI / 2]]) {
+      const wall = new THREE.Mesh(new THREE.PlaneGeometry(s, h), glassM.clone());
+      wall.position.set((dx as number) * TUBE_HALF, h / 2, (dz as number) * TUBE_HALF);
+      wall.rotation.y = ry as number;
       this.scene.add(wall);
     }
 
-    // рамка стекла
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x88ddff, transparent: true, opacity: 0.5 });
-    const corners = [
-      [-h, 0, -h], [h, 0, -h], [h, 0, h], [-h, 0, h], [-h, 0, -h],
+    // рамки
+    const pts = [
+      new THREE.Vector3(-TUBE_HALF, 0, -TUBE_HALF),
+      new THREE.Vector3(TUBE_HALF, 0, -TUBE_HALF),
+      new THREE.Vector3(TUBE_HALF, 0, TUBE_HALF),
+      new THREE.Vector3(-TUBE_HALF, 0, TUBE_HALF),
+      new THREE.Vector3(-TUBE_HALF, 0, -TUBE_HALF),
     ];
-    const pts = corners.map(([x, y, z]) => new THREE.Vector3(x, y, z));
-    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
-    this.scene.add(new THREE.Line(lineGeo, edgeMat));
-    const topPts = corners.map(([x, , z]) => new THREE.Vector3(x, wallH, z));
-    const topGeo = new THREE.BufferGeometry().setFromPoints(topPts);
-    this.scene.add(new THREE.Line(topGeo, edgeMat));
+    this.scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), edgeM));
+    const topPts = pts.map(p => new THREE.Vector3(p.x, h, p.z));
+    this.scene.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(topPts), edgeM));
+    for (let i = 0; i < 4; i++) {
+      this.scene.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([pts[i], topPts[i]]), edgeM
+      ));
+    }
   }
 
-  seedNetwork() {
-    const center = this.addJunction(0, 0);
-    const dirs: [number, number][] = [[0, -1], [1, 0], [0, 1], [-1, 0]];
-    const ring: number[] = [];
-    for (const [dx, dz] of dirs) {
-      const j = this.addJunction(dx * 1.8, dz * 1.8);
-      ring.push(j);
-      this.addVein(center, j, 0.35);
-    }
-    for (let i = 0; i < ring.length; i++) this.addVein(ring[i], ring[(i + 1) % ring.length], 0.2);
-    for (let i = 0; i < ring.length; i++) {
-      const j = this.junctions.get(ring[i])!;
-      this.addTip(ring[i], j.x / 1.8, j.z / 1.8);
-    }
+  // ─── центральное пятно-плазмодий ─────────────────────────────────────────
+
+  buildBlob() {
+    const geo = new THREE.SphereGeometry(3.5, 18, 18);
+    this.blobMesh = new THREE.Mesh(geo, this.matBlob.clone());
+    this.blobMesh.position.copy(this.blobPos);
+    this.blobMesh.scale.set(1, 0.22, 1);  // приплюснутый — как настоящий плазмодий
+    this.scene.add(this.blobMesh);
   }
 
   // ─── граф физарума ────────────────────────────────────────────────────────
 
-  addJunction(x: number, z: number): number {
+  seedNetwork() {
+    const s: Surface = 'floor';
+    const c = this.addJunction(new THREE.Vector3(0, 0.02, 0), s);
+    const dirs: [number, number][] = [[0,-1],[1,0],[0,1],[-1,0]];
+    const ring: number[] = [];
+    for (const [dx, dz] of dirs) {
+      const j = this.addJunction(new THREE.Vector3(dx * 2, 0.02, dz * 2), s);
+      ring.push(j);
+      this.addVein(c, j, 0.38);
+    }
+    for (let i = 0; i < 4; i++) this.addVein(ring[i], ring[(i+1)%4], 0.22);
+    for (const jid of ring) {
+      const j = this.junctions.get(jid)!;
+      const dx = j.pos.x / 2, dz = j.pos.z / 2;
+      this.addTip(jid, new THREE.Vector3(dx, 0, dz), s);
+    }
+  }
+
+  addJunction(pos: THREE.Vector3, surface: Surface): number {
     const id = uid();
-    const mesh = makeSphere(0.18, this.matJunc);
-    mesh.position.set(x, 0, z);
-    mesh.castShadow = true;
+    const mesh = makeSphere(0.16, this.matJunc.clone());
+    mesh.position.copy(pos);
     this.scene.add(mesh);
-    this.junctions.set(id, { id, x, z, nutrient: 0, mesh });
+    this.junctions.set(id, { id, pos: pos.clone(), surface, nutrient: 0, mesh });
     return id;
   }
 
-  addVein(a: number, b: number, r = 0.15): number {
+  addVein(a: number, b: number, r = 0.14): number {
     const id = uid();
     const ja = this.junctions.get(a)!, jb = this.junctions.get(b)!;
     const mat = this.matVein.clone();
-    const line = makeTube(ja.x, ja.z, jb.x, jb.z, r, mat);
-    line.castShadow = true;
-    this.scene.add(line);
-    this.veins.set(id, { id, a, b, radius: r, flow: 0, phase: Math.random() * Math.PI * 2, age: 0, line });
+    const mesh = makeCylinder(ja.pos, jb.pos, r, mat);
+    this.scene.add(mesh);
+    this.veins.set(id, { id, a, b, radius: r, flow: 0, phase: Math.random() * Math.PI * 2, age: 0, mesh });
     return id;
   }
 
-  addTip(junctionId: number, dx: number, dz: number): Tip {
-    const len = Math.hypot(dx, dz) || 1;
-    const j = this.junctions.get(junctionId)!;
-    const mesh = makeSphere(0.28, this.matTip.clone());
-    mesh.position.set(j.x, 0.05, j.z);
+  addTip(jId: number, dir: THREE.Vector3, surface: Surface): Tip {
+    const j = this.junctions.get(jId)!;
+    const mesh = makeSphere(0.3, this.matTip.clone());
+    mesh.position.copy(j.pos);
     this.scene.add(mesh);
-    const tip: Tip = { id: uid(), junctionId, dx: dx / len, dz: dz / len, energy: 1, len: 0, mesh };
+    const tip: Tip = {
+      id: uid(), junctionId: jId,
+      dir: projectOnSurface(dir, surface).normalize(),
+      surface, energy: 1, len: 0, mesh,
+    };
     this.tips.push(tip);
     return tip;
   }
 
   removeVein(id: number) {
-    const v = this.veins.get(id);
-    if (!v) return;
-    this.scene.remove(v.line);
-    (v.line.material as THREE.Material).dispose();
-    v.line.geometry.dispose();
+    const v = this.veins.get(id); if (!v) return;
+    this.scene.remove(v.mesh); this.disposeObject(v.mesh);
     this.veins.delete(id);
   }
 
   removeJunction(id: number) {
-    const j = this.junctions.get(id);
-    if (!j) return;
-    this.scene.remove(j.mesh);
+    const j = this.junctions.get(id); if (!j) return;
+    this.scene.remove(j.mesh); this.disposeObject(j.mesh);
     this.junctions.delete(id);
   }
 
   removeTip(i: number) {
-    const tip = this.tips[i];
-    this.scene.remove(tip.mesh);
+    const t = this.tips[i];
+    this.scene.remove(t.mesh); this.disposeObject(t.mesh);
     this.tips.splice(i, 1);
   }
 
@@ -439,6 +721,7 @@ export class GameEngine3D {
       if (!this.running) return;
       const dt = Math.min((t - this.lastTime) / 1000, 0.05);
       this.lastTime = t;
+      this.t = t;
       this.update(dt, t);
       this.controls.update();
       this.renderer.render(this.scene, this.camera);
@@ -447,17 +730,12 @@ export class GameEngine3D {
     this.raf = requestAnimationFrame(loop);
   }
 
-  stop() {
-    this.running = false;
-    cancelAnimationFrame(this.raf);
-  }
+  stop() { this.running = false; cancelAnimationFrame(this.raf); }
 
   resize() {
-    const W = this.canvas.clientWidth;
-    const H = this.canvas.clientHeight;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
     this.renderer.setSize(W, H);
-    this.renderer.setPixelRatio(dpr);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     this.camera.aspect = W / H;
     this.camera.updateProjectionMatrix();
   }
@@ -467,64 +745,52 @@ export class GameEngine3D {
   update(dt: number, t: number) {
     if (this.phase === 'dead') return;
 
+    this.updateBlob(dt, t);
     this.updatePressures(t);
     this.updateVeins(dt, t);
     this.updateTips(dt, t);
     this.pruneDeadVeins();
-
-    // маркер цели пульсирует
-    const mp = 0.7 + Math.sin(t * 0.003) * 0.3;
-    (this.targetMarker.material as THREE.MeshBasicMaterial).opacity = mp * 0.6;
-
-    // волны осязания
-    this.waveTimer -= dt;
-    const waveInterval = this.hasBuff('range') ? 0.14 : 0.28;
-    if (this.waveTimer <= 0) {
-      this.waveTimer = waveInterval;
-      this.emitWaves(t);
-    }
-    const waveSpeed = this.phase === 'tube' ? 12 : 22;
-    const waveRange = this.phase === 'tube' ? TUBE_HALF * 1.5 : 55;
-    for (let i = this.waveRings.length - 1; i >= 0; i--) {
-      const w = this.waveRings[i];
-      w.radius += waveSpeed * dt;
-      w.life -= dt;
-      const alpha = (w.life / 1.8) * 0.45;
-      const mat = w.mesh.material as THREE.MeshBasicMaterial;
-      mat.opacity = alpha;
-      // обновляем геометрию кольца
-      w.mesh.geometry.dispose();
-      w.mesh.geometry = new THREE.RingGeometry(w.radius - 0.08, w.radius + 0.08, 52);
-      // reveal объектов
-      this.checkReveal(w);
-      if (w.life <= 0 || w.radius > waveRange) {
-        this.scene.remove(w.mesh);
-        w.mesh.geometry.dispose();
-        (w.mesh.material as THREE.Material).dispose();
-        this.waveRings.splice(i, 1);
-      }
-    }
+    this.updateOrganisms(dt, t);
+    this.updateWaves(dt);
 
     // энергия
-    let drain = 1.1;
+    let drain = 1.0 + this.junctions.size * 0.0008;
     if (this.experiment?.label === 'Ускорение метаболизма') drain *= 2;
-    if (this.hasBuff('regen')) drain = -3;
+    if (this.hasBuff('regen')) drain = -2.5;
     this.energy = Math.max(0, Math.min(100, this.energy - drain * dt));
     if (this.energy <= 0) { this.phase = 'dead'; this.pushState(); return; }
 
+    // волны осязания
+    this.waveTimer -= dt;
+    const eyeLvl = this.getMutationLevel('eyes');
+    const waveInt = 0.28 - eyeLvl * 0.05;
+    if (this.waveTimer <= 0) { this.waveTimer = waveInt; this.emitWaves(); }
+
     // еда
-    this.eatFood();
+    this.eatNearby();
     this.foodTimer -= dt;
-    if (this.phase === 'tube') {
-      if (this.foodTimer <= 0 && this.foods3d.length < 6) { this.foodTimer = 4 + Math.random() * 5; this.spawnPellet(); }
-    } else if (this.phase === 'world') {
-      if (this.foodTimer <= 0 && this.foods3d.length < 28) { this.foodTimer = 1 + Math.random() * 2; this.spawnElement(); }
+    if (this.phase !== 'tube' && this.foodTimer <= 0) {
+      this.foodTimer = 2 + Math.random() * 3;
+      this.spawnBacteria();
+    }
+
+    // организмы
+    this.orgTimer -= dt;
+    if (this.phase !== 'tube' && this.orgTimer <= 0) {
+      this.orgTimer = 8 + Math.random() * 10;
+      const r = Math.random();
+      if (r < 0.4) this.spawnOrganisms(3, 'bacteria');
+      else if (r < 0.65) this.spawnOrganisms(2, 'fungus');
+      else this.spawnOrganisms(1, 'nematode');
     }
 
     // эксперименты
     if (this.phase === 'tube') {
       this.experimentTimer -= dt;
-      if (this.experimentTimer <= 0) { this.experimentTimer = 15 + Math.random() * 15; this.triggerExperiment(t); }
+      if (this.experimentTimer <= 0) {
+        this.experimentTimer = 14 + Math.random() * 14;
+        this.triggerExperiment(t);
+      }
     }
     if (this.experiment && t - this.experiment.at > 5000) this.experiment = null;
 
@@ -532,22 +798,55 @@ export class GameEngine3D {
 
     // побег
     const size = this.junctions.size;
-    if (this.phase === 'tube' && this.energy >= ESCAPE_ENERGY && size >= ESCAPE_SIZE) this.startEscape();
+    if (this.phase === 'tube' && this.energy >= 88 && size >= 200) this.startEscape();
     if (this.phase === 'breaking') {
       this.breakT += dt;
       if (this.breakT > 2.0) {
         this.phase = 'world';
         this.freedom = true;
-        this.generateWorld();
         this.cb.onAchievement('escape');
-        this.controls.maxDistance = 500;
+        this.controls.maxDistance = 400;
       }
     }
 
     if (size >= 500) this.cb.onAchievement('survive');
     if (size >= 1000) this.cb.onAchievement('size1000');
+    if (this.kills.nematode >= 3) this.cb.onAchievement('killer');
 
-    if (Math.floor(t / 180) !== Math.floor((t - dt * 1000) / 180)) this.pushState();
+    if (Math.floor(t / 160) !== Math.floor((t - dt * 1000) / 160)) this.pushState();
+  }
+
+  // ─── анимация пятна-плазмодия ─────────────────────────────────────────────
+
+  updateBlob(dt: number, t: number) {
+    const c = this.getCentroid();
+    this.blobPos.lerp(new THREE.Vector3(c.x, 0.05, c.z), dt * 3);
+    this.blobMesh.position.copy(this.blobPos);
+
+    // пульсация
+    const pulse = 0.9 + Math.sin(t * PULSE_FREQ * Math.PI * 2) * 0.1;
+    const sizeScale = Math.min(2.8, 1 + this.junctions.size * 0.003);
+    this.blobMesh.scale.set(sizeScale * pulse, 0.22 + Math.sin(t * 2.2) * 0.03, sizeScale * pulse);
+
+    // цвет от мутаций
+    const mat = this.blobMesh.material as THREE.MeshStandardMaterial;
+    if (this.hasBuff('mega')) {
+      mat.color.set(C_MEGA); mat.emissive.set(C_MEGA); mat.emissiveIntensity = 0.7;
+    } else {
+      mat.color.set(C_BODY); mat.emissive.set(C_BODY);
+      mat.emissiveIntensity = 0.4 + Math.sin(t * 1.8) * 0.15;
+    }
+
+    // если есть мутация глаз — добавляем «зрачки»
+    if (this.getMutationLevel('eyes') > 0 && !this.scene.getObjectByName('eye_l')) {
+      const eyeM = new THREE.MeshStandardMaterial({ color: 0x000011, emissive: 0x0044ff, emissiveIntensity: 1.5 });
+      const eyeGeo = new THREE.SphereGeometry(0.22, 8, 8);
+      const eyeL = new THREE.Mesh(eyeGeo, eyeM); eyeL.name = 'eye_l';
+      const eyeR = new THREE.Mesh(eyeGeo, eyeM); eyeR.name = 'eye_r';
+      this.blobMesh.add(eyeL); this.blobMesh.add(eyeR);
+      eyeL.position.set(-0.5, 2, 0.8);
+      eyeR.position.set(0.5, 2, 0.8);
+    }
   }
 
   // ─── Hagen-Poiseuille ─────────────────────────────────────────────────────
@@ -556,12 +855,11 @@ export class GameEngine3D {
     const pulse = Math.sin(t * PULSE_FREQ * Math.PI * 2);
     const pressure = new Map<number, number>();
     for (const [id, j] of this.junctions) {
-      const d = Math.hypot(this.target.x - j.x, this.target.z - j.z) + 0.1;
+      const d = j.pos.distanceTo(this.targetPos) + 0.1;
       pressure.set(id, 1.2 / d + pulse * 0.1 + j.nutrient * 0.4);
     }
     for (const [, v] of this.veins) {
-      const pa = pressure.get(v.a) ?? 0;
-      const pb = pressure.get(v.b) ?? 0;
+      const pa = pressure.get(v.a) ?? 0, pb = pressure.get(v.b) ?? 0;
       v.flow = Math.pow(v.radius, 4) * (pa - pb);
     }
   }
@@ -570,39 +868,57 @@ export class GameEngine3D {
     for (const [, v] of this.veins) {
       v.age += dt;
       v.phase += PULSE_FREQ * Math.PI * 2 * dt;
-      const absFlow = Math.abs(v.flow);
-      const targetR = absFlow > 0.00002
-        ? Math.min(MAX_RADIUS, v.radius + GROW_RATE * dt * (absFlow * 500))
-        : Math.max(RETRACT_R, v.radius - DECAY_RATE * dt);
-      if (this.hasBuff('growth')) v.radius = Math.min(MAX_RADIUS, v.radius + 0.12 * dt);
-      else v.radius += (targetR - v.radius) * Math.min(1, dt * 2);
+      const af = Math.abs(v.flow);
+      const tR = af > 0.00002
+        ? Math.min(MAX_R, v.radius + GROW_R * dt * af * 400)
+        : Math.max(RETRACT_R, v.radius - DECAY_R * dt);
+      if (this.hasBuff('growth')) v.radius = Math.min(MAX_R, v.radius + 0.1 * dt);
+      else v.radius += (tR - v.radius) * Math.min(1, dt * 2);
 
-      // обновляем mesh вейны — пульс меняет emissiveIntensity
       const ja = this.junctions.get(v.a), jb = this.junctions.get(v.b);
       if (!ja || !jb) continue;
-      const pulse = 0.7 + Math.sin(v.phase + t * PULSE_FREQ * Math.PI * 2) * 0.3;
-      const mat = v.line.material as THREE.MeshStandardMaterial;
-      const mega = this.hasBuff('mega');
-      mat.color.set(mega ? COL_MEGA : COL_VEIN);
-      mat.emissive.set(mega ? COL_MEGA : COL_VEIN);
-      mat.emissiveIntensity = (0.3 + Math.min(1, Math.abs(v.flow) * 800) * 0.7) * pulse;
 
-      // пересоздаём геометрию только если радиус сильно изменился
-      const curR = (v.line.geometry as THREE.CylinderGeometry).parameters?.radiusTop ?? 0;
-      if (Math.abs(curR - v.radius) > 0.015) {
-        v.line.geometry.dispose();
-        const dx = jb.x - ja.x, dz = jb.z - ja.z;
-        const len = Math.hypot(dx, dz) || 0.01;
-        v.line.geometry = new THREE.CylinderGeometry(v.radius, v.radius, len, 6, 1);
-        v.line.position.set((ja.x + jb.x) / 2, 0, (ja.z + jb.z) / 2);
-        v.line.rotation.z = Math.PI / 2;
-        v.line.rotation.y = -Math.atan2(dz, dx);
+      const pulse = 0.68 + Math.sin(v.phase + t * PULSE_FREQ * Math.PI * 2) * 0.32;
+      const mat = v.mesh.material as THREE.MeshStandardMaterial;
+      const mega = this.hasBuff('mega');
+      mat.color.set(mega ? C_MEGA : C_VEIN);
+      mat.emissive.set(mega ? C_MEGA : C_VEIN);
+      mat.emissiveIntensity = (0.3 + Math.min(1, af * 700) * 0.7) * pulse;
+      mat.opacity = 0.7 + pulse * 0.18;
+
+      // обновляем цилиндр если радиус изменился
+      const curR = (v.mesh.geometry as THREE.CylinderGeometry).parameters?.radiusTop ?? 0;
+      if (Math.abs(curR - v.radius) > 0.012) {
+        const dir = new THREE.Vector3().subVectors(jb.pos, ja.pos);
+        const len = dir.length() || 0.01;
+        v.mesh.geometry.dispose();
+        v.mesh.geometry = new THREE.CylinderGeometry(v.radius, v.radius, len, 7, 1);
+        v.mesh.position.copy(ja.pos).addScaledVector(dir.normalize(), len / 2);
+        v.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+      }
+
+      // бегущие капли протоплазмы
+      if (v.radius > 0.3 && Math.abs(v.flow) > 0.00002 && Math.random() < 0.015) {
+        const drop = makeSphere(v.radius * 0.55, new THREE.MeshBasicMaterial({ color: C_CORE }));
+        const dropProg = { t: 0, vein: v, mesh: drop, dir: v.flow > 0 ? 1 : -1 };
+        drop.position.copy(ja.pos);
+        this.scene.add(drop);
+        // анимируем каплю за 0.5с
+        const animate = () => {
+          dropProg.t += 0.03;
+          if (dropProg.t >= 1) { this.scene.remove(drop); this.disposeObject(drop); return; }
+          const frac = dropProg.dir > 0 ? dropProg.t : 1 - dropProg.t;
+          drop.position.lerpVectors(ja.pos, jb.pos, frac);
+          requestAnimationFrame(animate);
+        };
+        requestAnimationFrame(animate);
       }
     }
   }
 
   updateTips(dt: number, _t: number) {
-    const speed = (this.hasBuff('speed') ? TIP_SPEED * 1.8 : TIP_SPEED)
+    const flagellaLvl = this.getMutationLevel('flagella');
+    const speed = TIP_SPEED * (1 + flagellaLvl * 0.5) * (this.hasBuff('speed') ? 1.8 : 1)
                 * (this.experiment?.label === 'Криозаморозка' ? 0.35 : 1);
 
     for (let i = this.tips.length - 1; i >= 0; i--) {
@@ -610,219 +926,412 @@ export class GameEngine3D {
       const junc = this.junctions.get(tip.junctionId);
       if (!junc) { this.removeTip(i); continue; }
 
-      // хемотаксис к цели
-      let ax = this.target.x - junc.x;
-      let az = this.target.z - junc.z;
-      const tD = Math.hypot(ax, az) || 1;
-      ax /= tD; az /= tD;
+      // хемотаксис к цели (проекция на поверхность)
+      const toTarget = new THREE.Vector3().subVectors(this.targetPos, junc.pos);
+      const attract = projectOnSurface(toTarget, tip.surface).normalize();
 
-      // притяжение к ближайшей открытой еде
-      for (const { food, revealed } of this.foods3d) {
-        if (!revealed) continue;
-        const fd = Math.hypot(food.x - junc.x, food.y - junc.z);
-        if (fd < 28) { ax += (food.x - junc.x) / fd * 1.4; az += (food.y - junc.z) / fd * 1.4; }
+      // притяжение к ближайшей еде/бактерии
+      let bestFoodDir = new THREE.Vector3();
+      let bestFoodD = Infinity;
+      for (const org of this.organisms) {
+        if (org.kind !== 'bacteria') continue;
+        const d = junc.pos.distanceTo(org.pos);
+        if (d < 25 && d < bestFoodD) {
+          bestFoodD = d;
+          bestFoodDir = new THREE.Vector3().subVectors(org.pos, junc.pos).normalize();
+        }
       }
-      const aL = Math.hypot(ax, az) || 1; ax /= aL; az /= aL;
 
-      // случайный дрейф псевдоподии
-      tip.dx += ax * 0.14 + (Math.random() - 0.5) * 0.38;
-      tip.dz += az * 0.14 + (Math.random() - 0.5) * 0.38;
-      const tl = Math.hypot(tip.dx, tip.dz) || 1;
-      tip.dx /= tl; tip.dz /= tl;
+      // отталкивание от нематод (если есть токсины — наоборот)
+      const toxinLvl = this.getMutationLevel('toxin');
+      for (const org of this.organisms) {
+        if (org.kind !== 'nematode') continue;
+        const d = junc.pos.distanceTo(org.pos);
+        if (d < 15) {
+          const repel = new THREE.Vector3().subVectors(junc.pos, org.pos).normalize();
+          if (toxinLvl > 0) attract.addScaledVector(repel, -1.5);  // токсины — атакуем
+          else attract.addScaledVector(repel, 2.0);  // убегаем
+        }
+      }
 
-      const nx = junc.x + tip.dx * speed * dt;
-      const nz = junc.z + tip.dz * speed * dt;
+      // случайный дрейф
+      const randDir = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+      tip.dir.addScaledVector(attract, 0.16)
+               .addScaledVector(bestFoodDir, 0.2)
+               .addScaledVector(randDir, 0.36);
+      tip.dir = projectOnSurface(tip.dir, tip.surface).normalize();
 
-      // стенки пробирки
+      const newPos = junc.pos.clone().addScaledVector(tip.dir, speed * dt);
+
+      // проверяем переход на другую поверхность (ребро комнаты)
+      const nextSurface = this.checkSurfaceTransition(newPos, tip.surface);
+
+      // стенки в режиме пробирки
       if (this.phase === 'tube') {
-        if (Math.abs(nx) > TUBE_HALF - 0.6) tip.dx *= -1;
-        if (Math.abs(nz) > TUBE_HALF - 0.6) tip.dz *= -1;
-        if (Math.abs(nx) > TUBE_HALF - 0.6 || Math.abs(nz) > TUBE_HALF - 0.6) {
-          tip.mesh.position.set(junc.x, 0.05, junc.z); continue;
+        if (Math.abs(newPos.x) > TUBE_HALF - 0.5) tip.dir.x *= -1;
+        if (Math.abs(newPos.z) > TUBE_HALF - 0.5) tip.dir.z *= -1;
+        if (Math.abs(newPos.x) > TUBE_HALF - 0.5 || Math.abs(newPos.z) > TUBE_HALF - 0.5) {
+          tip.mesh.position.copy(junc.pos); continue;
         }
       }
 
       tip.len += speed * dt;
-
-      if (tip.len > 1.5 && this.junctions.size < MAX_JUNCTIONS && this.veins.size < MAX_VEINS) {
+      if (tip.len > 1.4 && this.junctions.size < MAX_J && this.veins.size < MAX_V) {
         tip.len = 0;
-        const newJ = this.addJunction(nx, nz);
-        this.addVein(tip.junctionId, newJ, 0.12 + Math.random() * 0.06);
+        const snapPos = this.snapToSurface(newPos, nextSurface);
+        const newJ = this.addJunction(snapPos, nextSurface);
+        this.addVein(tip.junctionId, newJ, 0.1 + Math.random() * 0.06);
         tip.junctionId = newJ;
-        tip.mesh.position.set(nx, 0.05, nz);
+        tip.surface = nextSurface;
+        tip.mesh.position.copy(snapPos);
 
-        const branchProb = this.hasBuff('growth') ? 0.28 : 0.12;
-        if (this.tips.length < MAX_TIPS && Math.random() < branchProb) {
-          const angle = (Math.random() - 0.5) * Math.PI * 0.72;
-          const cos = Math.cos(angle), sin = Math.sin(angle);
-          this.addTip(newJ, tip.dx * cos - tip.dz * sin, tip.dx * sin + tip.dz * cos);
+        // ветвление
+        const branchProb = this.hasBuff('growth') ? 0.26 : 0.11;
+        if (this.tips.length < MAX_T && Math.random() < branchProb) {
+          const angle = (Math.random() - 0.5) * Math.PI * 0.75;
+          const bDir = tip.dir.clone().applyAxisAngle(surfaceNormal(nextSurface), angle);
+          this.addTip(newJ, bDir, nextSurface);
         }
       } else {
-        junc.x = nx; junc.z = nz;
-        junc.mesh.position.set(nx, 0, nz);
-        tip.mesh.position.set(nx, 0.05, nz);
+        junc.pos.copy(this.snapToSurface(newPos, tip.surface));
+        junc.mesh.position.copy(junc.pos);
+        tip.mesh.position.copy(junc.pos);
       }
 
       // анимация кончика
       const mat = tip.mesh.material as THREE.MeshStandardMaterial;
-      mat.emissiveIntensity = 0.6 + Math.sin(_t * 0.004 + tip.id) * 0.4;
+      mat.emissiveIntensity = 0.7 + Math.sin(_t * 0.005 + tip.id) * 0.3;
 
-      if (this.energy < 12) tip.energy -= dt * 0.4;
+      if (this.energy < 10) tip.energy -= dt * 0.5;
       if (tip.energy <= 0) this.removeTip(i);
     }
 
     if (this.tips.length < 2 && this.junctions.size > 0) {
       const jArr = [...this.junctions.values()];
       const j = jArr[Math.floor(Math.random() * jArr.length)];
-      this.addTip(j.id, Math.random() - 0.5, Math.random() - 0.5);
+      const rDir = new THREE.Vector3(Math.random() - 0.5, 0, Math.random() - 0.5);
+      this.addTip(j.id, rDir, j.surface);
     }
+  }
+
+  // переход между поверхностями у края
+  checkSurfaceTransition(pos: THREE.Vector3, cur: Surface): Surface {
+    if (this.phase === 'tube') return cur;
+    const hw = LAB_W / 2, hd = LAB_D / 2, ch = LAB_H;
+    if (cur === 'floor') {
+      if (pos.x > hw - 0.3) return 'wall_px';
+      if (pos.x < -hw + 0.3) return 'wall_nx';
+      if (pos.z > hd - 0.3) return 'wall_pz';
+      if (pos.z < -hd + 0.3) return 'wall_nz';
+    }
+    if (cur === 'wall_px' || cur === 'wall_nx' || cur === 'wall_pz' || cur === 'wall_nz') {
+      if (pos.y < 0.2) return 'floor';
+      if (pos.y > ch - 0.2) return 'ceiling';
+    }
+    if (cur === 'ceiling') {
+      if (pos.x > hw - 0.3) return 'wall_px';
+      if (pos.x < -hw + 0.3) return 'wall_nx';
+      if (pos.z > hd - 0.3) return 'wall_pz';
+      if (pos.z < -hd + 0.3) return 'wall_nz';
+    }
+    return cur;
+  }
+
+  // привязать позицию к поверхности
+  snapToSurface(pos: THREE.Vector3, s: Surface): THREE.Vector3 {
+    const p = pos.clone();
+    const off = 0.02;
+    switch (s) {
+      case 'floor':   p.y = off; break;
+      case 'ceiling': p.y = LAB_H - off; break;
+      case 'wall_px': p.x = LAB_W / 2 - off; break;
+      case 'wall_nx': p.x = -LAB_W / 2 + off; break;
+      case 'wall_pz': p.z = LAB_D / 2 - off; break;
+      case 'wall_nz': p.z = -LAB_D / 2 + off; break;
+    }
+    return p;
   }
 
   pruneDeadVeins() {
     for (const [id, v] of this.veins) {
-      if (v.radius < RETRACT_R && v.age > 1.8) {
+      if (v.radius < RETRACT_R && v.age > 2) {
         this.removeVein(id);
-        this.tryPruneJunction(v.a);
-        this.tryPruneJunction(v.b);
+        this.tryPruneJ(v.a);
+        this.tryPruneJ(v.b);
       }
     }
   }
 
-  tryPruneJunction(jId: number) {
-    for (const [, v] of this.veins) { if (v.a === jId || v.b === jId) return; }
+  tryPruneJ(jId: number) {
+    for (const [, v] of this.veins) if (v.a === jId || v.b === jId) return;
     if (this.tips.some(t => t.junctionId === jId)) return;
     this.removeJunction(jId);
   }
 
-  // ─── волны осязания ───────────────────────────────────────────────────────
+  // ─── организмы ────────────────────────────────────────────────────────────
 
-  emitWaves(_t: number) {
-    const jArr = [...this.junctions.values()];
-    const step = Math.max(1, Math.floor(jArr.length / 12));
-    for (let i = 0; i < jArr.length; i += step) {
-      const j = jArr[i];
-      this.waveRings.push(makeWaveRing(j.x, j.z, 0.1, this.scene));
+  spawnBacteria() {
+    const c = this.getCentroid();
+    const ang = Math.random() * Math.PI * 2;
+    const d = 15 + Math.random() * 35;
+    this.spawnOrg('bacteria', new THREE.Vector3(c.x + Math.cos(ang) * d, 0.2, c.z + Math.sin(ang) * d));
+  }
+
+  spawnOrganisms(count: number, kind: Organism['kind']) {
+    const c = this.getCentroid();
+    for (let i = 0; i < count; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const d = kind === 'nematode' ? 25 + Math.random() * 40 : 12 + Math.random() * 28;
+      const pos = new THREE.Vector3(c.x + Math.cos(ang) * d, kind === 'nematode' ? 0.3 : 0.15, c.z + Math.sin(ang) * d);
+      this.spawnOrg(kind, pos);
     }
   }
 
-  checkReveal(w: WaveRing) {
-    for (const food of this.foods3d) {
-      if (food.revealed) continue;
-      const d = Math.hypot(food.food.x - w.x, food.food.y - w.z);
-      if (Math.abs(d - w.radius) < 1.2) {
-        food.revealed = true;
-        food.mesh.visible = true;
-        food.food.revealed = true;
-      }
+  spawnOrg(kind: Organism['kind'], pos: THREE.Vector3) {
+    const id = uid();
+    let geo: THREE.BufferGeometry;
+    let col: number;
+    let hp: number;
+    switch (kind) {
+      case 'bacteria':
+        geo = new THREE.SphereGeometry(0.28, 7, 7);
+        col = 0x44ff88; hp = 1; break;
+      case 'fungus':
+        geo = new THREE.ConeGeometry(0.5, 1.2, 8);
+        col = 0xff8833; hp = 4; break;
+      case 'nematode':
+        geo = new THREE.CapsuleGeometry(0.18, 1.4, 6, 10);
+        col = 0xff3333; hp = 8; break;
     }
-    for (const obj of this.labObjects) {
-      if (obj.revealed) continue;
-      const d = Math.hypot(obj.x - w.x, obj.z - w.z);
-      if (Math.abs(d - w.radius) < 3) {
-        obj.revealed = true;
-        // плавно показываем
-        obj.mesh.traverse(c => {
-          if ((c as THREE.Mesh).material) {
-            ((c as THREE.Mesh).material as THREE.MeshStandardMaterial).opacity = 1;
-            ((c as THREE.Mesh).material as THREE.MeshStandardMaterial).transparent = false;
+    const mat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.35, roughness: 0.6 });
+    const mesh = new THREE.Mesh(geo!, mat);
+    mesh.position.copy(pos);
+    mesh.castShadow = true;
+    this.scene.add(mesh);
+
+    const org: Organism = { id, kind, pos: pos.clone(), hp, mesh, vx: (Math.random()-0.5)*2, vz: (Math.random()-0.5)*2, phase: Math.random()*Math.PI*2 };
+    this.organisms.push(org);
+  }
+
+  updateOrganisms(dt: number, t: number) {
+    const toxinLvl = this.getMutationLevel('toxin');
+
+    for (let i = this.organisms.length - 1; i >= 0; i--) {
+      const org = this.organisms[i];
+      org.phase += dt;
+
+      if (org.kind === 'nematode') {
+        // нематоды ползают к физаруму
+        const c = this.getCentroid();
+        const toDx = c.x - org.pos.x, toDz = c.z - org.pos.z;
+        const toD = Math.hypot(toDx, toDz) + 0.1;
+        org.vx += (toDx / toD) * 4 * dt;
+        org.vz += (toDz / toD) * 4 * dt;
+        org.vx = Math.max(-3, Math.min(3, org.vx));
+        org.vz = Math.max(-3, Math.min(3, org.vz));
+        org.pos.x += org.vx * dt;
+        org.pos.z += org.vz * dt;
+        org.mesh.position.copy(org.pos);
+        org.mesh.rotation.y = Math.atan2(org.vx, org.vz);
+        org.mesh.rotation.z = Math.sin(org.phase * 8) * 0.3;  // извивание
+
+        // нематода ест физарум
+        for (let vi = this.veins.size - 1; vi >= 0; vi--) { /* handled below */ }
+        for (const [vid, v] of this.veins) {
+          const ja = this.junctions.get(v.a), jb = this.junctions.get(v.b);
+          if (!ja || !jb) continue;
+          const mid = ja.pos.clone().add(jb.pos).multiplyScalar(0.5);
+          if (org.pos.distanceTo(mid) < 1.5) {
+            v.radius -= 0.1 * dt;
+            this.energy -= 0.5 * dt;
           }
-        });
-        (obj.labelSprite.material as THREE.SpriteMaterial).opacity = 1;
-        // подсветка при обнаружении
-        const light = new THREE.PointLight(0x5feedd, 3, 12);
-        light.position.set(obj.x, 3, obj.z);
-        this.scene.add(light);
-        setTimeout(() => this.scene.remove(light), 1200);
+        }
+        // токсины убивают нематоду рядом
+        if (toxinLvl > 0) {
+          const c2 = this.getCentroid();
+          if (org.pos.distanceTo(new THREE.Vector3(c2.x, 0, c2.z)) < 6 + toxinLvl * 3) {
+            org.hp -= toxinLvl * 5 * dt;
+          }
+        }
+      } else if (org.kind === 'fungus') {
+        // грибки растут на месте и блокируют
+        org.mesh.scale.y = 1 + Math.sin(org.phase * 0.5) * 0.1;
+        // замедляют рост веин рядом
+        for (const [, v] of this.veins) {
+          const ja = this.junctions.get(v.a); if (!ja) continue;
+          if (ja.pos.distanceTo(org.pos) < 3) v.radius -= 0.05 * dt;
+        }
+        // грибок получает урон от токсинов
+        if (toxinLvl > 0) {
+          for (const [, j] of this.junctions) {
+            if (j.pos.distanceTo(org.pos) < 4) { org.hp -= toxinLvl * 2 * dt; break; }
+          }
+        }
+      } else {
+        // бактерии просто плавают
+        org.pos.x += Math.sin(org.phase * 1.3) * 0.8 * dt;
+        org.pos.z += Math.cos(org.phase * 1.1) * 0.8 * dt;
+        org.mesh.position.copy(org.pos);
+        org.mesh.rotation.y += dt * 1.5;
+      }
+
+      if (org.hp <= 0) {
+        this.scene.remove(org.mesh); this.disposeObject(org.mesh);
+        this.organisms.splice(i, 1);
+        this.kills[org.kind]++;
+        this.cb.onKill(org.kind);
       }
     }
   }
 
   // ─── еда ──────────────────────────────────────────────────────────────────
 
-  spawnPellet() {
-    const h = TUBE_HALF - 1.8;
-    const x = (Math.random() - 0.5) * h * 2;
-    const z = (Math.random() - 0.5) * h * 2;
-    const food: Food = { x, y: z, kind: 'pellet', revealed: false, reveal: 0, pulse: 0 };
-    const geo = new THREE.SphereGeometry(0.4, 8, 8);
-    const mat = new THREE.MeshStandardMaterial({ color: 0xa8ffb0, emissive: 0x50ff80, emissiveIntensity: 0.6, roughness: 0.4 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(x, 0.4, z);
-    mesh.visible = false;
-    mesh.castShadow = true;
-    this.scene.add(mesh);
-    this.foods3d.push({ food, mesh, revealed: false });
-  }
-
-  spawnElement() {
-    const cx = this.getCentroid().x, cz = this.getCentroid().z;
-    const ang = Math.random() * Math.PI * 2;
-    const dist = 28 + Math.random() * 80;
-    const x = cx + Math.cos(ang) * dist;
-    const z = cz + Math.sin(ang) * dist;
-    const pool = ELEMENTS.filter(e => e.rare ? Math.random() < 0.15 : true);
-    const el = pool[Math.floor(Math.random() * pool.length)];
-    const food: Food = { x, y: z, kind: 'element', element: el, revealed: false, reveal: 0, pulse: 0 };
-    const r = el.rare ? 0.9 : 0.65;
-    const col = new THREE.Color(el.color);
-    const geo = new THREE.SphereGeometry(r, 10, 10);
-    const mat = new THREE.MeshStandardMaterial({ color: col, emissive: col, emissiveIntensity: 0.7, roughness: 0.3 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(x, r, z);
-    mesh.visible = false;
-    mesh.castShadow = true;
-    this.scene.add(mesh);
-    this.foods3d.push({ food, mesh, revealed: false });
-  }
-
-  eatFood() {
-    const eatR = 1.6 + Math.min(1.5, this.junctions.size * 0.003);
-    for (let i = this.foods3d.length - 1; i >= 0; i--) {
-      const { food, mesh } = this.foods3d[i];
-      let minD = Infinity;
+  eatNearby() {
+    const eatR = 1.8 + Math.min(2, this.junctions.size * 0.003);
+    for (let i = this.organisms.length - 1; i >= 0; i--) {
+      const org = this.organisms[i];
+      if (org.kind === 'nematode') continue;  // нематоду не едим просто так
       for (const [, j] of this.junctions) {
-        const d = Math.hypot(food.x - j.x, food.y - j.z);
-        if (d < minD) minD = d;
-      }
-      if (minD < eatR) {
-        this.scene.remove(mesh);
-        if (food.kind === 'pellet') {
-          this.energy = Math.min(100, this.energy + 10);
-          this.burstGrowth(food.x, food.y, 7);
-        } else if (food.element) {
-          this.energy = Math.min(100, this.energy + (food.element.rare ? 24 : 12));
-          this.burstGrowth(food.x, food.y, food.element.rare ? 16 : 7);
-          this.addBuff(food.element.buff);
-          this.elementsEaten++;
-          this.cb.onElementEaten(food.element.rare);
-          if (food.element.rare) this.cb.onAchievement('rare');
-          if (this.elementsEaten >= 50) this.cb.onAchievement('eat50');
+        if (j.pos.distanceTo(org.pos) < eatR) {
+          const isFungus = org.kind === 'fungus';
+          this.energy = Math.min(100, this.energy + (isFungus ? 5 : 8));
+          if (!isFungus) this.burstGrowth(org.pos, 5);
+          else this.burstGrowth(org.pos, 2);
+          this.scene.remove(org.mesh); this.disposeObject(org.mesh);
+          this.organisms.splice(i, 1);
+          this.kills[org.kind]++;
+          this.cb.onKill(org.kind);
+          break;
         }
-        this.foods3d.splice(i, 1);
       }
+    }
+
+    // поедание элементов (если есть на полу как объекты)
+    for (const [, j] of this.junctions) {
+      // проверяем ближайшие labObjects типа 'element'
     }
   }
 
-  burstGrowth(fx: number, fz: number, count: number) {
+  burstGrowth(pos: THREE.Vector3, count: number) {
     let bestJ: Junction | null = null, bestD = Infinity;
     for (const [, j] of this.junctions) {
-      const d = Math.hypot(fx - j.x, fz - j.z);
+      const d = j.pos.distanceTo(pos);
       if (d < bestD) { bestD = d; bestJ = j; }
     }
     if (!bestJ) return;
-    for (let i = 0; i < count && this.tips.length < MAX_TIPS; i++) {
+    for (let i = 0; i < count && this.tips.length < MAX_T; i++) {
       const a = (i / count) * Math.PI * 2;
-      this.addTip(bestJ.id, Math.cos(a), Math.sin(a));
+      this.addTip(bestJ.id, new THREE.Vector3(Math.cos(a), 0, Math.sin(a)), bestJ.surface);
     }
     for (const [, v] of this.veins) {
       const ja = this.junctions.get(v.a), jb = this.junctions.get(v.b);
       if (!ja || !jb) continue;
-      const d = Math.hypot((ja.x + jb.x) / 2 - fx, (ja.z + jb.z) / 2 - fz);
-      if (d < 8) v.radius = Math.min(MAX_RADIUS, v.radius + 0.18);
+      const mid = ja.pos.clone().add(jb.pos).multiplyScalar(0.5);
+      if (mid.distanceTo(pos) < 8) v.radius = Math.min(MAX_R, v.radius + 0.18);
     }
   }
 
-  // ─── баффы / эксперименты ─────────────────────────────────────────────────
+  // ─── волны осязания ───────────────────────────────────────────────────────
+
+  emitWaves() {
+    const jArr = [...this.junctions.values()];
+    const step = Math.max(1, Math.floor(jArr.length / 10));
+    for (let i = 0; i < jArr.length; i += step) {
+      const j = jArr[i];
+      const geo = new THREE.RingGeometry(0.05, 0.15, 48);
+      const mat = new THREE.MeshBasicMaterial({ color: COL_WAVE, transparent: true, opacity: 0.5, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(geo, mat);
+
+      // ориентируем кольцо по нормали поверхности
+      const n = surfaceNormal(j.surface);
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+      mesh.position.copy(j.pos).addScaledVector(n, 0.05);
+      this.scene.add(mesh);
+
+      this.waves.push({ pos: j.pos.clone(), surface: j.surface, radius: 0.05, life: 1.8, mesh });
+    }
+  }
+
+  updateWaves(dt: number) {
+    const eyeLvl = this.getMutationLevel('eyes');
+    const waveRange = (this.phase === 'tube' ? TUBE_HALF * 1.4 : 42) * (1 + eyeLvl * 0.4);
+    const waveSpeed = this.phase === 'tube' ? 11 : 18;
+
+    for (let i = this.waves.length - 1; i >= 0; i--) {
+      const w = this.waves[i];
+      w.radius += waveSpeed * dt;
+      w.life -= dt;
+      const alpha = (w.life / 1.8) * 0.45;
+      const mat = w.mesh.material as THREE.MeshBasicMaterial;
+      mat.opacity = alpha;
+      w.mesh.geometry.dispose();
+      w.mesh.geometry = new THREE.RingGeometry(w.radius - 0.1, w.radius + 0.1, 52);
+
+      // проверяем что волна касается
+      this.checkWaveReveal(w);
+
+      if (w.life <= 0 || w.radius > waveRange) {
+        this.scene.remove(w.mesh); this.disposeObject(w.mesh);
+        this.waves.splice(i, 1);
+      }
+    }
+  }
+
+  checkWaveReveal(w: WaveRing) {
+    // организмы
+    for (const org of this.organisms) {
+      if (org.surface !== undefined) continue;
+      const d = org.pos.distanceTo(w.pos);
+      if (Math.abs(d - w.radius) < 2) {
+        const mat = org.mesh.material as THREE.MeshStandardMaterial;
+        mat.emissiveIntensity = 1.5;
+        setTimeout(() => { if (mat) mat.emissiveIntensity = 0.35; }, 300);
+      }
+    }
+    // лаб-объекты
+    for (const obj of this.labObjects) {
+      if (obj.revealed) continue;
+      const d = obj.pos.distanceTo(w.pos);
+      if (Math.abs(d - w.radius) < 4) {
+        obj.revealed = true;
+        // вспышка при обнаружении
+        const light = new THREE.PointLight(0x5feedd, 4, 16);
+        light.position.copy(obj.pos).y += 4;
+        this.scene.add(light);
+        setTimeout(() => this.scene.remove(light), 800);
+      }
+    }
+  }
+
+  // ─── мутации ─────────────────────────────────────────────────────────────
+
+  getMutationLevel(type: MutationType): number {
+    return this.mutations.find(m => m.type === type)?.level ?? 0;
+  }
+
+  applyMutation(symbol: string) {
+    // элемент → мутация
+    const map: Record<string, MutationType> = {
+      'Au': 'eyes', 'Pt': 'eyes',
+      'Fe': 'flagella', 'Na': 'flagella',
+      'Cl': 'toxin', 'K': 'toxin',
+      'He': 'spores', 'Li': 'spores',
+    };
+    const type = map[symbol];
+    if (!type) return;
+    const existing = this.mutations.find(m => m.type === type);
+    if (existing && existing.level < 3) {
+      existing.level++;
+      this.cb.onMutation(existing);
+    } else if (!existing) {
+      const mut: Mutation = { type, level: 1 };
+      this.mutations.push(mut);
+      this.cb.onMutation(mut);
+      this.cb.onAchievement('mutation_' + type);
+    }
+  }
+
+  // ─── эксперименты / баффы ─────────────────────────────────────────────────
 
   hasBuff(t: Buff['type']) { return this.buffs.some(b => b.type === t); }
 
@@ -830,8 +1339,7 @@ export class GameEngine3D {
     const m = BUFF_META[type];
     const until = performance.now() + m.ms;
     const ex = this.buffs.find(b => b.type === type);
-    if (ex) ex.until = until;
-    else this.buffs.push({ type, label: m.label, icon: m.icon, color: m.color, until });
+    if (ex) ex.until = until; else this.buffs.push({ type, label: m.label, icon: m.icon, color: m.color, until });
   }
 
   triggerExperiment(t: number) {
@@ -846,100 +1354,34 @@ export class GameEngine3D {
   startEscape() {
     this.phase = 'breaking';
     this.breakT = 0;
-    this.foods3d.forEach(({ mesh }) => this.scene.remove(mesh));
-    this.foods3d = [];
     this.experiment = null;
     this.pushState();
   }
 
-  // ─── генерация мира лаборатории ───────────────────────────────────────────
+  // ─── вспомогательные ─────────────────────────────────────────────────────
 
-  generateWorld() {
-    const bounds = 220;
-    let placed = 0, attempts = 0;
-    while (placed < 40 && attempts < 3000) {
-      attempts++;
-      const tpl = STRUCTURE_TYPES[Math.floor(Math.random() * STRUCTURE_TYPES.length)];
-      const w = 8 + Math.random() * 14;
-      const d = 8 + Math.random() * 14;
-      const h = 4 + Math.random() * 10;
-      const x = (Math.random() - 0.5) * bounds * 2;
-      const z = (Math.random() - 0.5) * bounds * 2;
-      if (Math.abs(x) < 30 && Math.abs(z) < 30) continue;
-      let overlap = false;
-      for (const obj of this.labObjects) {
-        if (Math.abs(obj.x - x) < (obj.w + w) / 2 + 4 && Math.abs(obj.z - z) < (obj.d + d) / 2 + 4) { overlap = true; break; }
-      }
-      if (overlap) continue;
-
-      const group = this.buildLabObject(x, z, w, d, h, tpl.type);
-      const label = tpl.label + ' #' + (placed + 1);
-      const sprite = makeLabelSprite(label);
-      sprite.position.set(x, h + 1.5, z);
-      (sprite.material as THREE.SpriteMaterial).opacity = 0;
-      this.scene.add(sprite);
-      this.labObjects.push({ mesh: group, x, z, w, d, h, label, revealed: false, labelSprite: sprite });
-      placed++;
-    }
-  }
-
-  buildLabObject(x: number, z: number, w: number, d: number, h: number, type: string): THREE.Group {
-    const group = new THREE.Group();
-    const col = new THREE.Color().setHSL(0.55 + Math.random() * 0.15, 0.6, 0.25);
-    const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.6, metalness: 0.3, transparent: true, opacity: 0 });
-
-    const body = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat.clone());
-    body.position.y = h / 2;
-    body.castShadow = true; body.receiveShadow = true;
-    group.add(body);
-
-    // детали зависят от типа
-    if (type === 'centrifuge') {
-      const cyl = new THREE.Mesh(new THREE.CylinderGeometry(w * 0.3, w * 0.3, h * 0.4, 12), mat.clone());
-      cyl.position.y = h + h * 0.2;
-      group.add(cyl);
-    } else if (type === 'rack') {
-      for (let i = 0; i < 4; i++) {
-        const tube = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, h * 0.8, 8), mat.clone());
-        tube.position.set(-w / 2 + (i + 0.5) * w / 4, h + h * 0.4, 0);
-        group.add(tube);
-      }
-    } else if (type === 'reactor') {
-      const sphere = new THREE.Mesh(new THREE.SphereGeometry(Math.min(w, d) * 0.4, 12, 12), mat.clone());
-      sphere.position.y = h + Math.min(w, d) * 0.4;
-      group.add(sphere);
-    }
-
-    // свечение-аура (невидимое пока не открыто)
-    const glow = new THREE.PointLight(new THREE.Color(0x5feedd), 0, 10);
-    glow.position.y = h;
-    group.add(glow);
-
-    group.position.set(x, 0, z);
-    this.scene.add(group);
-    return group;
-  }
-
-  // ─── вспомогательные ──────────────────────────────────────────────────────
-
-  getCentroid() {
+  getCentroid(): { x: number; z: number } {
     if (this.junctions.size === 0) return { x: 0, z: 0 };
     let sx = 0, sz = 0;
-    for (const [, j] of this.junctions) { sx += j.x; sz += j.z; }
+    for (const [, j] of this.junctions) { sx += j.pos.x; sz += j.pos.z; }
     return { x: sx / this.junctions.size, z: sz / this.junctions.size };
   }
 
   pushState() {
     this.bestSize = Math.max(this.bestSize, this.junctions.size);
+    const c = this.getCentroid();
+    // определяем текущую поверхность по ближайшему кончику
+    if (this.tips.length > 0) this.currentSurface = this.tips[this.tips.length - 1].surface;
     this.cb.onState({
       phase: this.phase, energy: this.energy,
       size: this.junctions.size, bestSize: this.bestSize,
       elementsEaten: this.elementsEaten, buffs: [...this.buffs],
       experiment: this.experiment, freedom: this.freedom,
+      mutations: [...this.mutations], surface: this.currentSurface,
     });
   }
 
-  // клик/тап — ставим аттрактант на плоскость Y=0
+  // клик/тап → аттрактант
   setTargetFromScreen(clientX: number, clientY: number) {
     const rect = this.canvas.getBoundingClientRect();
     const ndc = new THREE.Vector2(
@@ -947,13 +1389,42 @@ export class GameEngine3D {
       -((clientY - rect.top) / rect.height) * 2 + 1,
     );
     this.raycaster.setFromCamera(ndc, this.camera);
-    const pt = new THREE.Vector3();
-    this.raycaster.ray.intersectPlane(this.groundPlane, pt);
-    this.target.x = pt.x;
-    this.target.z = pt.z;
-    this.targetMarker.position.set(pt.x, 0.03, pt.z);
+
+    // пробуем все поверхности, берём ближайшую
+    let bestDist = Infinity;
+    let bestPt = new THREE.Vector3();
+    for (const { plane } of this.planes) {
+      const pt = new THREE.Vector3();
+      if (this.raycaster.ray.intersectPlane(plane, pt)) {
+        const d = this.camera.position.distanceTo(pt);
+        if (d < bestDist) { bestDist = d; bestPt = pt; }
+      }
+    }
+
+    this.targetPos.copy(bestPt);
+    // orient marker
+    const surface = this.nearestSurface(bestPt);
+    const n = surfaceNormal(surface);
+    this.targetMarker.position.copy(bestPt).addScaledVector(n, 0.05);
+    this.targetMarker.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
   }
 
-  // «голова» = центроид кончиков (для HUD)
-  head() { return this.getCentroid(); }
+  nearestSurface(pos: THREE.Vector3): Surface {
+    const hw = LAB_W / 2, hd = LAB_D / 2;
+    const dists: [number, Surface][] = [
+      [pos.y, 'floor'],
+      [LAB_H - pos.y, 'ceiling'],
+      [hw - pos.x, 'wall_px'],
+      [pos.x + hw, 'wall_nx'],
+      [hd - pos.z, 'wall_pz'],
+      [pos.z + hd, 'wall_nz'],
+    ];
+    dists.sort((a, b) => a[0] - b[0]);
+    return dists[0][1];
+  }
+
+  head() { return { x: this.blobPos.x, z: this.blobPos.z }; }
 }
+
+// константа цвета волн (нужна в движке)
+const COL_WAVE = new THREE.Color(0.78, 0.97, 1.0);

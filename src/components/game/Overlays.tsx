@@ -1,5 +1,47 @@
 import Icon from '@/components/ui/icon';
 import { Achievement, ExperimentEvent } from '@/lib/game/types';
+import { Mutation } from '@/lib/game/engine3d';
+
+export const MutationToast = ({ mutation }: { mutation: Mutation | null }) => {
+  if (!mutation) return null;
+  const meta: Record<string, { icon: string; color: string; label: string }> = {
+    eyes:     { icon: 'Eye',   color: '#6699ff', label: 'Мутация: Глаза' },
+    flagella: { icon: 'Zap',   color: '#ffdd44', label: 'Мутация: Жгутики' },
+    toxin:    { icon: 'Skull', color: '#44ff88', label: 'Мутация: Токсины' },
+    spores:   { icon: 'Wind',  color: '#cc88ff', label: 'Мутация: Споры' },
+  };
+  const m = meta[mutation.type];
+  return (
+    <div className="absolute top-24 left-1/2 -translate-x-1/2 animate-slide-down z-20">
+      <div className="hud-panel px-5 py-3 text-center" style={{ borderColor: m.color + '66' }}>
+        <div className="flex items-center gap-2 justify-center mb-1">
+          <Icon name={m.icon} size={18} style={{ color: m.color }} className="animate-glow-pulse" />
+          <span className="font-display font-bold text-xl" style={{ color: m.color }}>{m.label}</span>
+          <span className="font-mono text-sm text-white/50">{'★'.repeat(mutation.level)}</span>
+        </div>
+        <div className="text-white/55 text-xs font-mono">Ур. {mutation.level} — новая способность активирована</div>
+      </div>
+    </div>
+  );
+};
+
+export const KillToast = ({ kind }: { kind: string | null }) => {
+  if (!kind) return null;
+  const meta: Record<string, { icon: string; color: string; label: string }> = {
+    bacteria: { icon: 'Microscope', color: '#44ff88', label: 'Бактерия поглощена' },
+    fungus:   { icon: 'Leaf',       color: '#ff8833', label: 'Грибок уничтожен' },
+    nematode: { icon: 'Swords',     color: '#ff4444', label: 'Нематода побеждена!' },
+  };
+  const m = meta[kind] ?? { icon: 'Star', color: '#fff', label: kind };
+  return (
+    <div className="absolute bottom-20 left-1/2 -translate-x-1/2 animate-slide-down z-20">
+      <div className="hud-panel px-4 py-2 flex items-center gap-2" style={{ borderColor: m.color + '55' }}>
+        <Icon name={m.icon} size={14} style={{ color: m.color }} />
+        <span className="font-mono text-xs" style={{ color: m.color }}>{m.label}</span>
+      </div>
+    </div>
+  );
+};
 
 export const ExperimentToast = ({ exp }: { exp: ExperimentEvent | null }) => {
   if (!exp) return null;
